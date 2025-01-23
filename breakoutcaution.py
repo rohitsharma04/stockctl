@@ -104,6 +104,12 @@ def check_weekly_and_daily_conditions(data):
     # Get the latest weekly close
     latest_weekly_close = weekly_data['Close'].iloc[-1]
     
+    # Get the last week close
+    last_week_close = weekly_data['Close'].iloc[-2]
+    
+    # Get the last week open
+    last_week_open = weekly_data['Open'].iloc[-2]
+    
     # Get the latest daily close
     latest_daily_close = data['Close'].iloc[-1]
     
@@ -113,8 +119,11 @@ def check_weekly_and_daily_conditions(data):
     # Check if daily close is within 5% of 156 week max close
     condition2 = latest_daily_close >= 0.95 * max_close_156_weeks
     
+    # Check if last week candle is negative
+    condition3 = last_week_open > last_week_close
+    
     # Return True if either condition is met
-    return condition1 or condition2
+    return ((condition1 or condition2) and condition3)
 
 def stock_risen_30_percent(data):
     
