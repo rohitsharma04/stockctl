@@ -106,6 +106,6 @@ func setDefaults(cfg *Config) {
 	}
 	// TickersFile defaults to empty — auto-resolve from universe
 	if cfg.General.Market == "" {
-		cfg.General.Market = "us"
+		cfg.General.Market = "india"
 	}
 }
