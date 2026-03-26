@@ -1,91 +1,95 @@
 package marketdata
 
+import "sort"
+
 // Market defines a stock market with its Yahoo Finance configuration.
 type Market struct {
-	ID        string // short key: us, india, japan, etc.
-	Name      string // display name
-	Suffix    string // Yahoo Finance ticker suffix (e.g., ".NS" for NSE India)
-	Benchmark string // benchmark index symbol (already includes suffix)
-	Currency  string // currency code
+	ID             string  // short key: us, india, japan, etc.
+	Name           string  // display name
+	Suffix         string  // Yahoo Finance ticker suffix (e.g., ".NS" for NSE India)
+	Benchmark      string  // benchmark index symbol (already includes suffix)
+	Currency       string  // currency code
+	CurrencySymbol string  // currency display symbol ($, ₹, ¥, etc.)
+	MinPrice       float64 // minimum price filter for screeners
 }
 
 // Markets is the registry of supported stock markets.
 var Markets = map[string]Market{
 	"us": {
 		ID: "us", Name: "United States", Suffix: "",
-		Benchmark: "^GSPC", Currency: "USD",
+		Benchmark: "^GSPC", Currency: "USD", CurrencySymbol: "$", MinPrice: 5.0,
 	},
 	"india": {
 		ID: "india", Name: "India (NSE)", Suffix: ".NS",
-		Benchmark: "^NSEI", Currency: "INR",
+		Benchmark: "^NSEI", Currency: "INR", CurrencySymbol: "₹", MinPrice: 10.0,
 	},
 	"india-bse": {
 		ID: "india-bse", Name: "India (BSE)", Suffix: ".BO",
-		Benchmark: "^BSESN", Currency: "INR",
+		Benchmark: "^BSESN", Currency: "INR", CurrencySymbol: "₹", MinPrice: 10.0,
 	},
 	"japan": {
 		ID: "japan", Name: "Japan", Suffix: ".T",
-		Benchmark: "^N225", Currency: "JPY",
+		Benchmark: "^N225", Currency: "JPY", CurrencySymbol: "¥", MinPrice: 100.0,
 	},
 	"uk": {
 		ID: "uk", Name: "United Kingdom", Suffix: ".L",
-		Benchmark: "^FTSE", Currency: "GBP",
+		Benchmark: "^FTSE", Currency: "GBP", CurrencySymbol: "£", MinPrice: 0.10,
 	},
 	"germany": {
 		ID: "germany", Name: "Germany", Suffix: ".DE",
-		Benchmark: "^GDAXI", Currency: "EUR",
+		Benchmark: "^GDAXI", Currency: "EUR", CurrencySymbol: "€", MinPrice: 1.0,
 	},
 	"france": {
 		ID: "france", Name: "France", Suffix: ".PA",
-		Benchmark: "^FCHI", Currency: "EUR",
+		Benchmark: "^FCHI", Currency: "EUR", CurrencySymbol: "€", MinPrice: 1.0,
 	},
 	"canada": {
 		ID: "canada", Name: "Canada", Suffix: ".TO",
-		Benchmark: "^GSPTSE", Currency: "CAD",
+		Benchmark: "^GSPTSE", Currency: "CAD", CurrencySymbol: "CA$", MinPrice: 1.0,
 	},
 	"australia": {
 		ID: "australia", Name: "Australia", Suffix: ".AX",
-		Benchmark: "^AXJO", Currency: "AUD",
+		Benchmark: "^AXJO", Currency: "AUD", CurrencySymbol: "A$", MinPrice: 0.10,
 	},
 	"hong-kong": {
 		ID: "hong-kong", Name: "Hong Kong", Suffix: ".HK",
-		Benchmark: "^HSI", Currency: "HKD",
+		Benchmark: "^HSI", Currency: "HKD", CurrencySymbol: "HK$", MinPrice: 1.0,
 	},
 	"china": {
 		ID: "china", Name: "China (Shanghai)", Suffix: ".SS",
-		Benchmark: "000001.SS", Currency: "CNY",
+		Benchmark: "000001.SS", Currency: "CNY", CurrencySymbol: "¥", MinPrice: 1.0,
 	},
 	"korea": {
 		ID: "korea", Name: "South Korea", Suffix: ".KS",
-		Benchmark: "^KS11", Currency: "KRW",
+		Benchmark: "^KS11", Currency: "KRW", CurrencySymbol: "₩", MinPrice: 1000.0,
 	},
 	"singapore": {
 		ID: "singapore", Name: "Singapore", Suffix: ".SI",
-		Benchmark: "^STI", Currency: "SGD",
+		Benchmark: "^STI", Currency: "SGD", CurrencySymbol: "S$", MinPrice: 0.10,
 	},
 	"brazil": {
 		ID: "brazil", Name: "Brazil", Suffix: ".SA",
-		Benchmark: "^BVSP", Currency: "BRL",
+		Benchmark: "^BVSP", Currency: "BRL", CurrencySymbol: "R$", MinPrice: 1.0,
 	},
 	"taiwan": {
 		ID: "taiwan", Name: "Taiwan", Suffix: ".TW",
-		Benchmark: "^TWII", Currency: "TWD",
+		Benchmark: "^TWII", Currency: "TWD", CurrencySymbol: "NT$", MinPrice: 10.0,
 	},
 	"italy": {
 		ID: "italy", Name: "Italy", Suffix: ".MI",
-		Benchmark: "FTSEMIB.MI", Currency: "EUR",
+		Benchmark: "FTSEMIB.MI", Currency: "EUR", CurrencySymbol: "€", MinPrice: 1.0,
 	},
 	"spain": {
 		ID: "spain", Name: "Spain", Suffix: ".MC",
-		Benchmark: "^IBEX", Currency: "EUR",
+		Benchmark: "^IBEX", Currency: "EUR", CurrencySymbol: "€", MinPrice: 1.0,
 	},
 	"sweden": {
 		ID: "sweden", Name: "Sweden", Suffix: ".ST",
-		Benchmark: "^OMX", Currency: "SEK",
+		Benchmark: "^OMX", Currency: "SEK", CurrencySymbol: "kr", MinPrice: 1.0,
 	},
 	"switzerland": {
 		ID: "switzerland", Name: "Switzerland", Suffix: ".SW",
-		Benchmark: "^SSMI", Currency: "CHF",
+		Benchmark: "^SSMI", Currency: "CHF", CurrencySymbol: "CHF", MinPrice: 1.0,
 	},
 }
 
@@ -95,14 +99,7 @@ func ListMarkets() []string {
 	for k := range Markets {
 		keys = append(keys, k)
 	}
-	// Sort for consistent display
-	for i := 0; i < len(keys); i++ {
-		for j := i + 1; j < len(keys); j++ {
-			if keys[i] > keys[j] {
-				keys[i], keys[j] = keys[j], keys[i]
-			}
-		}
-	}
+	sort.Strings(keys)
 	return keys
 }
 

@@ -178,8 +178,9 @@ func runPairs(cmd *cobra.Command, args []string) error {
 		fmt.Printf("\n🔗 %s — %s (corr: %.4f)\n", pair.Stock1, pair.Stock2, pair.Correlation)
 		fmt.Printf("   Hedge Ratio: %.4f\n", result.HedgeRatio)
 		fmt.Printf("   Trades: %d\n", len(result.Trades))
-		fmt.Printf("   Final Capital: ₹%.2f\n", result.FinalCapital)
-		fmt.Printf("   Total Profit: ₹%.2f\n", result.TotalProfit)
+		cs := activeMarket.CurrencySymbol
+		fmt.Printf("   Final Capital: %s%.2f\n", cs, result.FinalCapital)
+		fmt.Printf("   Total Profit: %s%.2f\n", cs, result.TotalProfit)
 		if len(result.Trades) > 0 {
 			fmt.Printf("   Win Rate: %.1f%%\n", result.WinRate*100)
 		}
@@ -187,6 +188,7 @@ func runPairs(cmd *cobra.Command, args []string) error {
 
 	// Summary table
 	if len(results) > 0 && appConfig.General.Output == "table" {
+		cs := activeMarket.CurrencySymbol
 		fmt.Println("\n📊 Summary:")
 		tw := output.NewTableWriter(os.Stdout)
 		tw.SetHeaders("Pair", "Hedge Ratio", "Trades", "Profit", "Win Rate")
@@ -195,7 +197,7 @@ func runPairs(cmd *cobra.Command, args []string) error {
 				fmt.Sprintf("%s/%s", r.Stock1, r.Stock2),
 				fmt.Sprintf("%.4f", r.HedgeRatio),
 				fmt.Sprintf("%d", len(r.Trades)),
-				fmt.Sprintf("₹%.2f", r.TotalProfit),
+				fmt.Sprintf("%s%.2f", cs, r.TotalProfit),
 				fmt.Sprintf("%.1f%%", r.WinRate*100),
 			)
 		}
