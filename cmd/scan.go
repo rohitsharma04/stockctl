@@ -38,6 +38,8 @@ Available strategies:
   high-performance     Sustained uptrend with consistent new highs
   stellar-breakout     Volume explosion + Heikin-Ashi confirmation
   descending-breakout  Descending triangle breakout with volume
+  rsi-bounce           RSI oversold bounce with volume confirmation
+  macd-crossover       MACD bullish crossover with trend confirmation
   all                  Run all screeners
 
 Examples:

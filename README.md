@@ -37,7 +37,7 @@ stockctl scan breakout-caution --tickers stocks.csv --market india
 stockctl scan all --tickers nifty500.csv --output json
 ```
 
-**Strategies:** `breakout-caution`, `high-performance`, `stellar-breakout`, `descending-breakout`, `all`
+**Strategies:** `breakout-caution`, `high-performance`, `stellar-breakout`, `descending-breakout`, `rsi-bounce`, `macd-crossover`, `all`
 
 ### Pairs trading analysis
 

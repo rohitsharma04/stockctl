@@ -73,5 +73,8 @@ func Registry(cfg *config.Config) map[string]Screener {
 	dbCfg := cfg.Screeners["descending_breakout"]
 	screeners["descending-breakout"] = NewDescendingBreakout(dbCfg)
 
+	screeners["rsi-bounce"] = NewRSIBounce()
+	screeners["macd-crossover"] = NewMACDCrossover()
+
 	return screeners
 }

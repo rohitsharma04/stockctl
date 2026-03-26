@@ -7,6 +7,7 @@ import (
 	"math"
 
 	"github.com/cinar/indicator/v2/helper"
+	"github.com/cinar/indicator/v2/momentum"
 	"github.com/cinar/indicator/v2/trend"
 	"github.com/cinar/indicator/v2/volatility"
 )
@@ -240,4 +241,88 @@ func Tail(values []float64, n int) []float64 {
 		return values
 	}
 	return values[len(values)-n:]
+}
+
+// RSI calculates the Relative Strength Index for the given period.
+// Returns a slice of the same length as input; values before warmup are NaN.
+func RSI(closes []float64, period int) []float64 {
+	n := len(closes)
+	if n == 0 || period <= 0 {
+		return make([]float64, n)
+	}
+
+	rsi := momentum.NewRsiWithPeriod[float64](period)
+	result := helper.ChanToSlice(rsi.Compute(helper.SliceToChan(closes)))
+
+	idle := rsi.IdlePeriod()
+	out := make([]float64, n)
+	for i := 0; i < idle && i < n; i++ {
+		out[i] = math.NaN()
+	}
+	for i, v := range result {
+		if i+idle < n {
+			out[i+idle] = v
+		}
+	}
+	return out
+}
+
+// EMA calculates the Exponential Moving Average for the given period.
+func EMA(values []float64, period int) []float64 {
+	n := len(values)
+	if n == 0 || period <= 0 {
+		return make([]float64, n)
+	}
+
+	ema := trend.NewEmaWithPeriod[float64](period)
+	result := helper.ChanToSlice(ema.Compute(helper.SliceToChan(values)))
+
+	idle := ema.IdlePeriod()
+	out := make([]float64, n)
+	for i := 0; i < idle && i < n; i++ {
+		out[i] = math.NaN()
+	}
+	for i, v := range result {
+		if i+idle < n {
+			out[i+idle] = v
+		}
+	}
+	return out
+}
+
+// MACD calculates the MACD line and signal line.
+// Returns (macdLine, signalLine) slices of the same length as input.
+func MACD(closes []float64) ([]float64, []float64) {
+	n := len(closes)
+	if n == 0 {
+		return make([]float64, n), make([]float64, n)
+	}
+
+	macd := trend.NewMacd[float64]()
+	macdCh, signalCh := macd.Compute(helper.SliceToChan(closes))
+
+	macdLine := helper.ChanToSlice(macdCh)
+	signalLine := helper.ChanToSlice(signalCh)
+
+	// The MACD idle period (26-1 + 9-1 = 34 for signal)
+	macdIdle := macd.Ema2.IdlePeriod() // 25 (for MACD line)
+	signalIdle := macdIdle + macd.Ema3.IdlePeriod() // 25 + 8 = 33 (for signal)
+
+	macdOut := make([]float64, n)
+	signalOut := make([]float64, n)
+	for i := 0; i < n; i++ {
+		macdOut[i] = math.NaN()
+		signalOut[i] = math.NaN()
+	}
+	for i, v := range macdLine {
+		if i+macdIdle < n {
+			macdOut[i+macdIdle] = v
+		}
+	}
+	for i, v := range signalLine {
+		if i+signalIdle < n {
+			signalOut[i+signalIdle] = v
+		}
+	}
+	return macdOut, signalOut
 }

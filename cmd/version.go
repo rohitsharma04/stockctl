@@ -34,7 +34,8 @@ var versionCmd = &cobra.Command{
 
 		strategies := []string{
 			"breakout-caution", "high-performance",
-			"stellar-breakout", "descending-breakout", "all",
+			"stellar-breakout", "descending-breakout",
+			"rsi-bounce", "macd-crossover", "all",
 		}
 
 		markets := marketdata.ListMarkets()
