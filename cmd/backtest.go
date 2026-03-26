@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/csv"
 	"fmt"
 	"os"
@@ -10,15 +11,18 @@ import (
 	"time"
 
 	"github.com/rohitsharma04/stockctl/internal/backtest"
+	"github.com/rohitsharma04/stockctl/internal/marketdata"
 	"github.com/rohitsharma04/stockctl/internal/output"
+	"github.com/rohitsharma04/stockctl/internal/screener"
 	"github.com/spf13/cobra"
 )
 
 var (
-	btInput   string
-	btTPRange string
-	btSLRange string
-	btCapital float64
+	btInput    string
+	btTPRange  string
+	btSLRange  string
+	btCapital  float64
+	btStrategy string
 )
 
 var backtestCmd = &cobra.Command{
@@ -27,18 +31,22 @@ var backtestCmd = &cobra.Command{
 	Long: `Run a grid search over take-profit and stop-loss combinations
 to find the optimal strategy parameters.
 
-Reads pre-processed breakout entries from a CSV file with columns:
-  symbol, entry_date, entry_price, highs, lows, closes
+Can either read pre-processed entries from a CSV, or run a scan internally:
+
+  CSV mode:      stockctl backtest --input trading_results.csv
+  Strategy mode: stockctl backtest --strategy breakout-caution -m india
 
 Examples:
   stockctl backtest --input trading_results.csv
+  stockctl backtest --strategy breakout-caution -m us --output json
   stockctl backtest --input results.csv --tp-range 0.05:0.50 --sl-range 0.01:0.10
   stockctl backtest --input results.csv --capital 200000`,
 	RunE: runBacktest,
 }
 
 func init() {
-	backtestCmd.Flags().StringVar(&btInput, "input", "trading_results.csv", "CSV file with breakout entries")
+	backtestCmd.Flags().StringVar(&btInput, "input", "", "CSV file with breakout entries")
+	backtestCmd.Flags().StringVar(&btStrategy, "strategy", "", "run scan and backtest results (bypasses --input)")
 	backtestCmd.Flags().StringVar(&btTPRange, "tp-range", "", "take-profit range min:max (default from config)")
 	backtestCmd.Flags().StringVar(&btSLRange, "sl-range", "", "stop-loss range min:max (default from config)")
 	backtestCmd.Flags().Float64Var(&btCapital, "capital", 0, "capital per trade (default from config)")
@@ -73,14 +81,33 @@ func runBacktest(cmd *cobra.Command, args []string) error {
 		capital = btCapital
 	}
 
-	// Load entries
-	entries, err := loadBreakoutEntries(btInput)
-	if err != nil {
-		return fmt.Errorf("loading entries: %w", err)
+	// Load entries — either from strategy scan or CSV file
+	var entries []backtest.BreakoutEntry
+	if btStrategy != "" {
+		// Strategy mode: run scan internally and construct entries
+		var err error
+		entries, err = buildEntriesFromScan(btStrategy)
+		if err != nil {
+			return err
+		}
+		logf("📊 Scan produced %d breakout entries for backtesting\n", len(entries))
+	} else {
+		// CSV mode
+		if btInput == "" {
+			return fmt.Errorf("provide --input CSV or --strategy to run scan")
+		}
+		var err error
+		entries, err = loadBreakoutEntries(btInput)
+		if err != nil {
+			return fmt.Errorf("loading entries: %w", err)
+		}
+		logf("📊 Loaded %d breakout entries from %s\n", len(entries), btInput)
 	}
-	logf("📊 Loaded %d breakout entries from %s\n", len(entries), btInput)
 
 	if len(entries) == 0 {
+		if btStrategy != "" {
+			return fmt.Errorf("no breakout signals found with strategy %q — nothing to backtest", btStrategy)
+		}
 		return fmt.Errorf("no entries found in %s", btInput)
 	}
 
@@ -244,4 +271,97 @@ func parseFloatList(s string) []float64 {
 		}
 	}
 	return result
+}
+
+// buildEntriesFromScan runs a scan with the given strategy and builds
+// BreakoutEntry objects from the results.
+func buildEntriesFromScan(strategy string) ([]backtest.BreakoutEntry, error) {
+	ctx := context.Background()
+
+	// Load tickers
+	rawTickers, err := marketdata.GetUniverse(appConfig.General.Market)
+	if err != nil {
+		return nil, fmt.Errorf("no built-in universe for %s: %w", appConfig.General.Market, err)
+	}
+
+	tickers := make([]string, len(rawTickers))
+	for i, t := range rawTickers {
+		tickers[i] = activeMarket.ApplySuffix(t)
+	}
+
+	// Create provider (with disk cache)
+	yahoo := marketdata.NewYahooProvider(5)
+	var provider marketdata.Provider = yahoo
+	if !noCache {
+		provider = marketdata.NewDiskCachedProvider(yahoo, 24*time.Hour)
+	}
+
+	// Get screeners
+	registry := screener.Registry(appConfig)
+	var screeners []screener.Screener
+	if strategy == "all" {
+		for _, s := range registry {
+			screeners = append(screeners, s)
+		}
+		// Layer in-memory cache for scan-all
+		if !noCache {
+			provider = marketdata.NewCachedProviderFrom(provider)
+		} else {
+			provider = marketdata.NewCachedProvider(yahoo)
+		}
+	} else {
+		s, ok := registry[strategy]
+		if !ok {
+			return nil, fmt.Errorf("unknown strategy: %s", strategy)
+		}
+		screeners = append(screeners, s)
+	}
+
+	// Fetch benchmark
+	logf("📊 Scanning %d tickers with %s for backtest...\n", len(tickers), strategy)
+	benchmark, _ := provider.GetHistory(ctx, activeMarket.Benchmark, "5y", "1d")
+
+	// Run scan and build entries
+	var entries []backtest.BreakoutEntry
+	w := appConfig.General.Workers
+	if w <= 0 {
+		w = 8
+	}
+
+	for _, scr := range screeners {
+		results, _ := runScreener(ctx, scr, tickers, provider, benchmark, w)
+		for _, r := range results {
+			if r.Score < 1.0 {
+				continue // Only fully passing stocks for backtest
+			}
+			// Re-fetch the data (should hit cache) to build the entry
+			data, err := provider.GetHistory(ctx, r.Ticker, "5y", "1d")
+			if err != nil || len(data) < 60 {
+				continue
+			}
+
+			n := len(data)
+			// Use last 60 trading days as the backtest window
+			window := 60
+			if n < window {
+				window = n
+			}
+			tail := data[n-window:]
+
+			highs := marketdata.Highs(tail)
+			lows := marketdata.Lows(tail)
+			closes := marketdata.Closes(tail)
+
+			entries = append(entries, backtest.BreakoutEntry{
+				Symbol:     r.Ticker,
+				EntryDate:  tail[0].Date.Format("2006-01-02"),
+				EntryPrice: closes[0],
+				Highs:      highs,
+				Lows:       lows,
+				Closes:     closes,
+			})
+		}
+	}
+
+	return entries, nil
 }

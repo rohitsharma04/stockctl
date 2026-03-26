@@ -6,18 +6,26 @@ import (
 	"sync"
 )
 
-// CachedProvider wraps a YahooProvider with an in-memory cache.
+// CachedProvider wraps any Provider with an in-memory cache.
 // Cache entries live for the duration of the process — ideal for
 // `scan all` where each ticker's data is fetched once and reused
 // across 4 screeners.
 type CachedProvider struct {
-	inner *YahooProvider
+	inner Provider
 	mu    sync.RWMutex
 	cache map[string][]OHLCV
 }
 
 // NewCachedProvider creates a caching wrapper around a YahooProvider.
 func NewCachedProvider(inner *YahooProvider) *CachedProvider {
+	return &CachedProvider{
+		inner: inner,
+		cache: make(map[string][]OHLCV),
+	}
+}
+
+// NewCachedProviderFrom creates a caching wrapper around any Provider.
+func NewCachedProviderFrom(inner Provider) *CachedProvider {
 	return &CachedProvider{
 		inner: inner,
 		cache: make(map[string][]OHLCV),

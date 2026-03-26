@@ -19,6 +19,7 @@ var (
 	marketID     string
 	verbose      bool
 	quiet        bool
+	noCache      bool
 	appConfig    *config.Config
 	activeMarket marketdata.Market
 	runDir       string // unique per-run output directory
@@ -59,7 +60,7 @@ Configuration: ~/.stockctl/config.toml (override: STOCKCTL_CONFIG env var or --c
 Output files:  /tmp/stockctl/run_<timestamp>_<id>/ (unique per run, never overwrites)`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		// Skip config loading for the markets command
-		if cmd.Name() == "markets" || cmd.Name() == "version" {
+		if cmd.Name() == "markets" || cmd.Name() == "version" || cmd.Name() == "stats" || cmd.Name() == "clear" {
 			return nil
 		}
 
@@ -154,6 +155,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&marketID, "market", "m", "", "stock market: us, india, japan, uk, etc. (use 'stockctl markets' to list)")
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "verbose output")
 	rootCmd.PersistentFlags().BoolVarP(&quiet, "quiet", "q", false, "suppress all progress output (agent mode)")
+	rootCmd.PersistentFlags().BoolVar(&noCache, "no-cache", false, "bypass disk cache")
 	rootCmd.AddCommand(marketsCmd)
 }
 

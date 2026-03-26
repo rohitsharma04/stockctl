@@ -72,7 +72,11 @@ func runInspect(cmd *cobra.Command, args []string) error {
 	startTime := time.Now()
 
 	fullTicker := activeMarket.ApplySuffix(ticker)
-	provider := marketdata.NewYahooProvider(5)
+	yahoo := marketdata.NewYahooProvider(5)
+	var provider marketdata.Provider = yahoo
+	if !noCache {
+		provider = marketdata.NewDiskCachedProvider(yahoo, 24*time.Hour)
+	}
 
 	// Fetch 5 years of daily data
 	logf("📊 Fetching data for %s (%s)...\n", fullTicker, activeMarket.Name)

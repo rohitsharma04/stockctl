@@ -100,10 +100,17 @@ func runScan(cmd *cobra.Command, args []string) error {
 		tickers[i] = activeMarket.ApplySuffix(t)
 	}
 
-	// Create provider (cached for "all" to avoid redundant API calls)
+	// Create provider with disk cache (unless --no-cache)
 	yahoo := marketdata.NewYahooProvider(5)
 	var provider marketdata.Provider = yahoo
-	if strategy == "all" {
+	if !noCache {
+		diskCached := marketdata.NewDiskCachedProvider(yahoo, 24*time.Hour)
+		provider = diskCached
+		if strategy == "all" {
+			// Layer in-memory cache on top for scan-all (avoids re-reading disk per screener)
+			provider = marketdata.NewCachedProviderFrom(diskCached)
+		}
+	} else if strategy == "all" {
 		provider = marketdata.NewCachedProvider(yahoo)
 	}
 
