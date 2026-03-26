@@ -1,0 +1,22 @@
+# Go binary
+stockctl
+*.exe
+
+# Go build cache
+/vendor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data files
+*.csv
+
+# Config with credentials (keep config.toml as template)
+# config.local.toml
