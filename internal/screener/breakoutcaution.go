@@ -2,6 +2,7 @@ package screener
 
 import (
 	"context"
+	"fmt"
 	"math"
 
 	"github.com/rohitsharma04/stockctl/internal/config"
@@ -11,7 +12,6 @@ import (
 
 // BreakoutCaution screens for Bollinger Band breakouts with volume confirmation
 // and relative strength against a benchmark.
-// Port of breakoutcaution.py.
 type BreakoutCaution struct {
 	cfg config.ScreenerConfig
 }
@@ -47,10 +47,14 @@ func NewBreakoutCaution(cfg config.ScreenerConfig) *BreakoutCaution {
 func (b *BreakoutCaution) Name() string        { return "breakout-caution" }
 func (b *BreakoutCaution) Description() string  { return "Bollinger Band breakout + volume + relative strength" }
 
-func (b *BreakoutCaution) Screen(_ context.Context, data []marketdata.OHLCV, benchmark []marketdata.OHLCV) (bool, error) {
+func (b *BreakoutCaution) Screen(_ context.Context, data []marketdata.OHLCV, benchmark []marketdata.OHLCV) (*ScreenResult, error) {
+	var filters []FilterResult
+
 	// Need at least 252 trading days (1 year)
 	if len(data) < 252 {
-		return false, nil
+		return &ScreenResult{Pass: false, Score: 0, Filters: []FilterResult{
+			{Name: "min_data", Pass: false, Value: float64(len(data)), Threshold: 252, Detail: "insufficient data"},
+		}}, nil
 	}
 
 	closes := marketdata.Closes(data)
@@ -59,56 +63,99 @@ func (b *BreakoutCaution) Screen(_ context.Context, data []marketdata.OHLCV, ben
 	volumes := marketdata.Volumes(data)
 	n := len(closes)
 
-	// Price above $5
-	if closes[n-1] <= 5.0 {
-		return false, nil
-	}
+	// 1. Min price
+	price := closes[n-1]
+	filters = append(filters, FilterResult{
+		Name:      "min_price",
+		Pass:      price > 5.0,
+		Value:     price,
+		Threshold: 5.0,
+		Detail:    fmt.Sprintf("$%.2f", price),
+	})
 
-	// 10% rise in last month (22 trading days)
+	// 2. Momentum: 10% rise in last month (22 trading days)
+	momentum := 0.0
 	if n >= b.cfg.MomentumPeriod+1 {
-		momentum := (closes[n-1] - closes[n-1-b.cfg.MomentumPeriod]) / closes[n-1-b.cfg.MomentumPeriod]
-		if momentum <= b.cfg.MomentumThreshold {
-			return false, nil
-		}
+		momentum = (closes[n-1] - closes[n-1-b.cfg.MomentumPeriod]) / closes[n-1-b.cfg.MomentumPeriod]
 	}
+	filters = append(filters, FilterResult{
+		Name:      "momentum",
+		Pass:      momentum > b.cfg.MomentumThreshold,
+		Value:     momentum,
+		Threshold: b.cfg.MomentumThreshold,
+		Detail:    fmt.Sprintf("%.1f%% vs %.1f%% required", momentum*100, b.cfg.MomentumThreshold*100),
+	})
 
-	// Daily high above Bollinger upper band
+	// 3. Bollinger breakout: daily high above upper band
 	upper, _, _ := indicators.BollingerBands(closes, b.cfg.BollingerPeriod, b.cfg.BollingerStd)
-	if math.IsNaN(upper[n-1]) || highs[n-1] <= upper[n-1] {
-		return false, nil
+	bbPass := !math.IsNaN(upper[n-1]) && highs[n-1] > upper[n-1]
+	bbVal := 0.0
+	if !math.IsNaN(upper[n-1]) {
+		bbVal = highs[n-1] - upper[n-1]
 	}
+	filters = append(filters, FilterResult{
+		Name:      "bollinger_breakout",
+		Pass:      bbPass,
+		Value:     highs[n-1],
+		Threshold: upper[n-1],
+		Detail:    fmt.Sprintf("high %.2f vs upper band %.2f (diff: %.2f)", highs[n-1], upper[n-1], bbVal),
+	})
 
-	// Volume > 1.5x 10-day average
+	// 4. Volume spike: volume > 1.5x 10-day average
 	avgVol := indicators.SMA(volumes, 10)
-	if math.IsNaN(avgVol[n-1]) || volumes[n-1] <= avgVol[n-1]*b.cfg.VolumeMultiplier {
-		return false, nil
+	volPass := !math.IsNaN(avgVol[n-1]) && volumes[n-1] > avgVol[n-1]*b.cfg.VolumeMultiplier
+	volRatio := 0.0
+	if !math.IsNaN(avgVol[n-1]) && avgVol[n-1] > 0 {
+		volRatio = volumes[n-1] / avgVol[n-1]
 	}
+	filters = append(filters, FilterResult{
+		Name:      "volume_spike",
+		Pass:      volPass,
+		Value:     volRatio,
+		Threshold: b.cfg.VolumeMultiplier,
+		Detail:    fmt.Sprintf("%.2fx vs %.2fx required", volRatio, b.cfg.VolumeMultiplier),
+	})
 
-	// Close above dynamic SMA (SMA + 0.5 * ATR)
+	// 5. Dynamic SMA: close above SMA + 0.5 * ATR
 	sma := indicators.SMA(closes, b.cfg.SMAWindow)
 	atr := indicators.ATR(highs, lows, closes, b.cfg.ATRWindow)
-	if math.IsNaN(sma[n-1]) || math.IsNaN(atr[n-1]) {
-		return false, nil
+	dynamicPass := false
+	dynamicSMA := math.NaN()
+	if !math.IsNaN(sma[n-1]) && !math.IsNaN(atr[n-1]) {
+		dynamicSMA = sma[n-1] + 0.5*atr[n-1]
+		dynamicPass = closes[n-1] > dynamicSMA
 	}
-	dynamicSMA := sma[n-1] + 0.5*atr[n-1]
-	if closes[n-1] <= dynamicSMA {
-		return false, nil
-	}
+	filters = append(filters, FilterResult{
+		Name:      "dynamic_sma",
+		Pass:      dynamicPass,
+		Value:     closes[n-1],
+		Threshold: dynamicSMA,
+		Detail:    fmt.Sprintf("close %.2f vs dynamic SMA %.2f", closes[n-1], dynamicSMA),
+	})
 
-	// Relative strength vs benchmark > threshold
+	// 6. Relative strength vs benchmark > threshold
+	rsPass := true // default pass if no benchmark
+	rsVal := math.NaN()
 	if benchmark != nil && len(benchmark) >= len(data) {
 		benchCloses := marketdata.Closes(benchmark)
-		// Align lengths
 		offset := len(benchCloses) - n
 		benchAligned := benchCloses[offset:]
 
 		stockReturns := indicators.PctChange(closes)
 		benchReturns := indicators.PctChange(benchAligned)
 		rs := indicators.RelativeStrength(stockReturns, benchReturns, 20)
-		if len(rs) > 0 && !math.IsNaN(rs[len(rs)-1]) && rs[len(rs)-1] <= b.cfg.RSThreshold {
-			return false, nil
+		if len(rs) > 0 && !math.IsNaN(rs[len(rs)-1]) {
+			rsVal = rs[len(rs)-1]
+			rsPass = rsVal > b.cfg.RSThreshold
 		}
 	}
+	filters = append(filters, FilterResult{
+		Name:      "relative_strength",
+		Pass:      rsPass,
+		Value:     rsVal,
+		Threshold: b.cfg.RSThreshold,
+		Detail:    fmt.Sprintf("RS %.4f vs %.4f required", rsVal, b.cfg.RSThreshold),
+	})
 
-	return true, nil
+	return NewScreenResult(filters), nil
 }

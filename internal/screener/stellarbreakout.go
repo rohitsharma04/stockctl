@@ -2,6 +2,7 @@ package screener
 
 import (
 	"context"
+	"fmt"
 	"math"
 
 	"github.com/rohitsharma04/stockctl/internal/config"
@@ -11,7 +12,6 @@ import (
 
 // StellarBreakout screens for volume-confirmed breakouts with Heikin-Ashi
 // trend confirmation and bull consolidation patterns.
-// Port of stellarbreakout.py.
 type StellarBreakout struct {
 	cfg config.ScreenerConfig
 }
@@ -41,9 +41,11 @@ func NewStellarBreakout(cfg config.ScreenerConfig) *StellarBreakout {
 func (s *StellarBreakout) Name() string        { return "stellar-breakout" }
 func (s *StellarBreakout) Description() string  { return "Volume explosion + Heikin-Ashi confirmation" }
 
-func (s *StellarBreakout) Screen(_ context.Context, data []marketdata.OHLCV, _ []marketdata.OHLCV) (bool, error) {
+func (s *StellarBreakout) Screen(_ context.Context, data []marketdata.OHLCV, _ []marketdata.OHLCV) (*ScreenResult, error) {
 	if len(data) < s.cfg.MinDataDays {
-		return false, nil
+		return &ScreenResult{Pass: false, Score: 0, Filters: []FilterResult{
+			{Name: "min_data", Pass: false, Value: float64(len(data)), Threshold: float64(s.cfg.MinDataDays)},
+		}}, nil
 	}
 
 	closes := marketdata.Closes(data)
@@ -51,56 +53,68 @@ func (s *StellarBreakout) Screen(_ context.Context, data []marketdata.OHLCV, _ [
 	highs := marketdata.Highs(data)
 	lows := marketdata.Lows(data)
 	n := len(closes)
+	var filters []FilterResult
 
-	// Price > $5
-	if closes[n-1] <= 5.0 {
-		return false, nil
-	}
+	// 1. Min price
+	filters = append(filters, FilterResult{
+		Name: "min_price", Pass: closes[n-1] > 5.0, Value: closes[n-1], Threshold: 5.0,
+	})
 
 	// Resample to weekly
 	weekly := marketdata.ToWeekly(data)
 	wn := len(weekly)
 	if wn < 55 {
-		return false, nil
+		return &ScreenResult{Pass: false, Score: 0, Filters: []FilterResult{
+			{Name: "min_weekly_data", Pass: false, Value: float64(wn), Threshold: 55},
+		}}, nil
 	}
 
-	// Check volume condition: recent 5-week max > 50% of 3-year max (excl last 3 weeks)
-	if !s.checkVolumeCondition(weekly) {
-		return false, nil
-	}
+	// 2. Volume explosion: recent 5-week max > 50% of 3-year max (excl last 3 weeks)
+	volExpPass, volExpRatio := s.checkVolumeCondition(weekly)
+	filters = append(filters, FilterResult{
+		Name: "volume_explosion", Pass: volExpPass, Value: volExpRatio, Threshold: s.cfg.VolumeExplosionRatio,
+		Detail: fmt.Sprintf("recent/historical ratio %.2f vs %.2f required", volExpRatio, s.cfg.VolumeExplosionRatio),
+	})
 
-	// Close 2 weeks ago > 61.8% of 52-week high
-	if !s.checkCloseCondition(weekly) {
-		return false, nil
-	}
+	// 3. Fibonacci proximity: close 2 weeks ago > 61.8% of 52-week high
+	fibPass, fibRatio := s.checkCloseCondition(weekly)
+	filters = append(filters, FilterResult{
+		Name: "fibonacci_proximity", Pass: fibPass, Value: fibRatio, Threshold: s.cfg.FibonacciLevel,
+		Detail: fmt.Sprintf("close ratio %.2f vs %.2f threshold", fibRatio, s.cfg.FibonacciLevel),
+	})
 
-	// Bull consolidation: up week → down week (lower volume, close holds)
-	if !s.checkConsolidation(weekly) {
-		return false, nil
-	}
+	// 4. Bull consolidation: up week → down week (lower volume, close holds)
+	consPass := s.checkConsolidation(weekly)
+	filters = append(filters, FilterResult{
+		Name: "bull_consolidation", Pass: consPass, Value: 1, Threshold: 1,
+		Detail: "up week → down week with lower volume and held close",
+	})
 
-	// Heikin-Ashi confirmation: HA Close >= HA Open today
+	// 5. Heikin-Ashi bullish: HA Close >= HA Open today
 	haOpen, haClose := indicators.HeikinAshi(opens, highs, lows, closes)
-	if haClose[n-1] < haOpen[n-1] {
-		return false, nil
-	}
+	haPass := haClose[n-1] >= haOpen[n-1]
+	filters = append(filters, FilterResult{
+		Name: "heikinashi_bullish", Pass: haPass, Value: haClose[n-1], Threshold: haOpen[n-1],
+		Detail: fmt.Sprintf("HA close=%.2f vs HA open=%.2f", haClose[n-1], haOpen[n-1]),
+	})
 
-	// Recent volume significant: 5-week avg >= 30% of historical max
-	if !s.checkRecentVolumeSignificance(weekly) {
-		return false, nil
-	}
+	// 6. Volume significance: 5-week avg >= 30% of historical max
+	sigPass, sigRatio := s.checkRecentVolumeSignificance(weekly)
+	filters = append(filters, FilterResult{
+		Name: "volume_significance", Pass: sigPass, Value: sigRatio, Threshold: s.cfg.VolumeSignificance,
+		Detail: fmt.Sprintf("avg/max ratio %.2f vs %.2f required", sigRatio, s.cfg.VolumeSignificance),
+	})
 
-	return true, nil
+	return NewScreenResult(filters), nil
 }
 
-func (s *StellarBreakout) checkVolumeCondition(weekly []marketdata.WeeklyBar) bool {
+func (s *StellarBreakout) checkVolumeCondition(weekly []marketdata.WeeklyBar) (bool, float64) {
 	wn := len(weekly)
 	recentWeeks := s.cfg.RecentWeeks
 	if wn < recentWeeks+3 {
-		return false
+		return false, 0
 	}
 
-	// Max volume of last 5 weeks
 	maxRecentVol := 0.0
 	for i := wn - recentWeeks; i < wn; i++ {
 		if weekly[i].Volume > maxRecentVol {
@@ -108,7 +122,6 @@ func (s *StellarBreakout) checkVolumeCondition(weekly []marketdata.WeeklyBar) bo
 		}
 	}
 
-	// Max volume excluding last 3 weeks
 	maxHistVol := 0.0
 	for i := 0; i < wn-3; i++ {
 		if weekly[i].Volume > maxHistVol {
@@ -116,19 +129,21 @@ func (s *StellarBreakout) checkVolumeCondition(weekly []marketdata.WeeklyBar) bo
 		}
 	}
 
-	return maxRecentVol > maxHistVol*s.cfg.VolumeExplosionRatio
+	ratio := 0.0
+	if maxHistVol > 0 {
+		ratio = maxRecentVol / maxHistVol
+	}
+	return maxRecentVol > maxHistVol*s.cfg.VolumeExplosionRatio, ratio
 }
 
-func (s *StellarBreakout) checkCloseCondition(weekly []marketdata.WeeklyBar) bool {
+func (s *StellarBreakout) checkCloseCondition(weekly []marketdata.WeeklyBar) (bool, float64) {
 	wn := len(weekly)
 	if wn < 55 {
-		return false
+		return false, 0
 	}
 
-	// Close from 2 weeks ago
 	close2WeeksAgo := weekly[wn-3].Close
 
-	// 52-week range starting from 3 weeks ago
 	maxClose := 0.0
 	start := wn - 55
 	if start < 0 {
@@ -140,25 +155,22 @@ func (s *StellarBreakout) checkCloseCondition(weekly []marketdata.WeeklyBar) boo
 		}
 	}
 
-	return close2WeeksAgo > maxClose*s.cfg.FibonacciLevel
+	ratio := 0.0
+	if maxClose > 0 {
+		ratio = close2WeeksAgo / maxClose
+	}
+	return close2WeeksAgo > maxClose*s.cfg.FibonacciLevel, ratio
 }
 
 func (s *StellarBreakout) checkConsolidation(weekly []marketdata.WeeklyBar) bool {
 	wn := len(weekly)
-	if wn < 3 {
+	if wn < 4 {
 		return false
 	}
 
 	twoWeeksAgo := weekly[wn-3]
 	oneWeekAgo := weekly[wn-2]
-
-	// Calculate pct changes
-	prevClose := 0.0
-	if wn >= 4 {
-		prevClose = weekly[wn-4].Close
-	} else {
-		return false
-	}
+	prevClose := weekly[wn-4].Close
 
 	pctTwoWeeks := 0.0
 	if prevClose != 0 {
@@ -170,30 +182,24 @@ func (s *StellarBreakout) checkConsolidation(weekly []marketdata.WeeklyBar) bool
 		pctOneWeek = (oneWeekAgo.Close - twoWeeksAgo.Close) / twoWeeksAgo.Close
 	}
 
-	// Up week followed by down week, lower volume, close holds above the up week's open
-	condition1 := pctTwoWeeks > 0       // Two weeks ago was up
-	condition2 := pctOneWeek < 0         // One week ago was down
-	condition3 := oneWeekAgo.Volume < twoWeeksAgo.Volume // Lower volume
-	condition4 := twoWeeksAgo.Open < oneWeekAgo.Close    // Close holds
-
-	return condition1 && condition2 && condition3 && condition4
+	return pctTwoWeeks > 0 && pctOneWeek < 0 &&
+		oneWeekAgo.Volume < twoWeeksAgo.Volume &&
+		twoWeeksAgo.Open < oneWeekAgo.Close
 }
 
-func (s *StellarBreakout) checkRecentVolumeSignificance(weekly []marketdata.WeeklyBar) bool {
+func (s *StellarBreakout) checkRecentVolumeSignificance(weekly []marketdata.WeeklyBar) (bool, float64) {
 	wn := len(weekly)
 	recentWeeks := s.cfg.RecentWeeks
 	if wn < recentWeeks+3 {
-		return false
+		return false, 0
 	}
 
-	// 5-week average volume
 	totalVol := 0.0
 	for i := wn - recentWeeks; i < wn; i++ {
 		totalVol += weekly[i].Volume
 	}
 	avgRecent := totalVol / float64(recentWeeks)
 
-	// Historical max (excl last 3 weeks)
 	maxHistVol := 0.0
 	for i := 0; i < wn-3; i++ {
 		if weekly[i].Volume > maxHistVol {
@@ -202,8 +208,9 @@ func (s *StellarBreakout) checkRecentVolumeSignificance(weekly []marketdata.Week
 	}
 
 	if maxHistVol == 0 || math.IsNaN(maxHistVol) {
-		return false
+		return false, 0
 	}
 
-	return avgRecent >= s.cfg.VolumeSignificance*maxHistVol
+	ratio := avgRecent / maxHistVol
+	return avgRecent >= s.cfg.VolumeSignificance*maxHistVol, ratio
 }

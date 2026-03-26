@@ -134,8 +134,11 @@ func runScan(cmd *cobra.Command, args []string) error {
 }
 
 type scanResult struct {
-	Ticker   string `json:"ticker"`
-	Strategy string `json:"strategy"`
+	Ticker        string  `json:"ticker"`
+	Strategy      string  `json:"strategy"`
+	Score         float64 `json:"score"`
+	FiltersPassed int     `json:"filters_passed"`
+	TotalFilters  int     `json:"total_filters"`
 }
 
 func runScreener(ctx context.Context, scr screener.Screener, tickers []string,
@@ -166,7 +169,7 @@ func runScreener(ctx context.Context, scr screener.Screener, tickers []string,
 					continue
 				}
 
-				pass, err := scr.Screen(ctx, data, benchmark)
+				result, err := scr.Screen(ctx, data, benchmark)
 				if err != nil {
 					if verbose {
 						fmt.Fprintf(os.Stderr, "  ⚠ %s: %v\n", j.ticker, err)
@@ -175,9 +178,21 @@ func runScreener(ctx context.Context, scr screener.Screener, tickers []string,
 					continue
 				}
 
-				if pass {
+				if result.Pass {
+					passed := 0
+					for _, f := range result.Filters {
+						if f.Pass {
+							passed++
+						}
+					}
 					mu.Lock()
-					results = append(results, scanResult{Ticker: j.ticker, Strategy: scr.Name()})
+					results = append(results, scanResult{
+						Ticker:        j.ticker,
+						Strategy:      scr.Name(),
+						Score:         result.Score,
+						FiltersPassed: passed,
+						TotalFilters:  len(result.Filters),
+					})
 					mu.Unlock()
 				}
 
@@ -205,10 +220,10 @@ func renderResults(strategyName string, results []scanResult, format string) {
 
 	case output.FormatCSV:
 		filename := filepath.Join(runDir, fmt.Sprintf("%s_%s.csv", strategyName, time.Now().Format("2006-01-02_150405")))
-		headers := []string{"Ticker", "Strategy"}
+		headers := []string{"Ticker", "Strategy", "Score", "Filters Passed", "Total Filters"}
 		var rows [][]string
 		for _, r := range results {
-			rows = append(rows, []string{r.Ticker, r.Strategy})
+			rows = append(rows, []string{r.Ticker, r.Strategy, fmt.Sprintf("%.2f", r.Score), fmt.Sprintf("%d", r.FiltersPassed), fmt.Sprintf("%d", r.TotalFilters)})
 		}
 		if err := output.WriteCSV(filename, headers, rows); err != nil {
 			fmt.Fprintf(os.Stderr, "Error writing CSV: %v\n", err)
@@ -218,9 +233,9 @@ func renderResults(strategyName string, results []scanResult, format string) {
 
 	default: // table
 		tw := output.NewTableWriter(os.Stdout)
-		tw.SetHeaders("Ticker", "Strategy")
+		tw.SetHeaders("Ticker", "Strategy", "Score", "Filters")
 		for _, r := range results {
-			tw.AddRow(r.Ticker, r.Strategy)
+			tw.AddRow(r.Ticker, r.Strategy, fmt.Sprintf("%.0f%%", r.Score*100), fmt.Sprintf("%d/%d", r.FiltersPassed, r.TotalFilters))
 		}
 		tw.Render()
 	}
