@@ -48,6 +48,7 @@ func init() {
 
 func runPairs(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
+	startTime := time.Now()
 	cfg := appConfig.Pairs
 
 	// Resolve overrides
@@ -88,8 +89,8 @@ func runPairs(cmd *cobra.Command, args []string) error {
 	provider := marketdata.NewYahooProvider(5)
 
 	// Download data for all stocks
-	fmt.Printf("🌍 Market: %s (%s)\n", activeMarket.Name, activeMarket.Currency)
-	fmt.Printf("📊 Downloading data for %d stocks...\n", len(stocks))
+	logf("🌍 Market: %s (%s)\n", activeMarket.Name, activeMarket.Currency)
+	logf("📊 Downloading data for %d stocks...\n", len(stocks))
 	type stockEntry struct {
 		symbol string
 		data   []marketdata.OHLCV
@@ -99,10 +100,10 @@ func runPairs(cmd *cobra.Command, args []string) error {
 	for _, sym := range stocks {
 		data, err := provider.GetHistory(ctx, sym, "5y", "1d")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "  ⚠ Skipping %s: %v\n", sym, err)
+			logf("  ⚠ Skipping %s: %v\n", sym, err)
 			continue
 		}
-		fmt.Printf("  ✓ %s (%d bars)\n", sym, len(data))
+		logf("  ✓ %s (%d bars)\n", sym, len(data))
 		entries = append(entries, stockEntry{symbol: sym, data: data})
 	}
 
@@ -111,7 +112,7 @@ func runPairs(cmd *cobra.Command, args []string) error {
 	}
 
 	// Calculate returns
-	fmt.Println("📈 Calculating correlations...")
+	logf("📈 Calculating correlations...\n")
 	validSymbols := make([]string, len(entries))
 	allReturns := make([][]float64, len(entries))
 	for i, e := range entries {
@@ -122,10 +123,10 @@ func runPairs(cmd *cobra.Command, args []string) error {
 
 	// Find correlated pairs
 	corrPairs := pairs.FindCorrelatedPairs(validSymbols, allReturns, threshold)
-	fmt.Printf("🔗 Found %d correlated pairs (threshold: %.2f)\n", len(corrPairs), threshold)
+	logf("🔗 Found %d correlated pairs (threshold: %.2f)\n", len(corrPairs), threshold)
 
 	if len(corrPairs) == 0 {
-		fmt.Println("No correlated pairs found. Try lowering --threshold.")
+		logf("No correlated pairs found. Try lowering --threshold.\n")
 		return nil
 	}
 
@@ -175,33 +176,46 @@ func runPairs(cmd *cobra.Command, args []string) error {
 		)
 		results = append(results, result)
 
-		fmt.Printf("\n🔗 %s — %s (corr: %.4f)\n", pair.Stock1, pair.Stock2, pair.Correlation)
-		fmt.Printf("   Hedge Ratio: %.4f\n", result.HedgeRatio)
-		fmt.Printf("   Trades: %d\n", len(result.Trades))
+		logf("\n🔗 %s — %s (corr: %.4f)\n", pair.Stock1, pair.Stock2, pair.Correlation)
+		logf("   Hedge Ratio: %.4f\n", result.HedgeRatio)
+		logf("   Trades: %d\n", len(result.Trades))
 		cs := activeMarket.CurrencySymbol
-		fmt.Printf("   Final Capital: %s%.2f\n", cs, result.FinalCapital)
-		fmt.Printf("   Total Profit: %s%.2f\n", cs, result.TotalProfit)
+		logf("   Final Capital: %s%.2f\n", cs, result.FinalCapital)
+		logf("   Total Profit: %s%.2f\n", cs, result.TotalProfit)
 		if len(result.Trades) > 0 {
-			fmt.Printf("   Win Rate: %.1f%%\n", result.WinRate*100)
+			logf("   Win Rate: %.1f%%\n", result.WinRate*100)
 		}
 	}
 
-	// Summary table
-	if len(results) > 0 && appConfig.General.Output == "table" {
-		cs := activeMarket.CurrencySymbol
-		fmt.Println("\n📊 Summary:")
-		tw := output.NewTableWriter(os.Stdout)
-		tw.SetHeaders("Pair", "Hedge Ratio", "Trades", "Profit", "Win Rate")
-		for _, r := range results {
-			tw.AddRow(
-				fmt.Sprintf("%s/%s", r.Stock1, r.Stock2),
-				fmt.Sprintf("%.4f", r.HedgeRatio),
-				fmt.Sprintf("%d", len(r.Trades)),
-				fmt.Sprintf("%s%.2f", cs, r.TotalProfit),
-				fmt.Sprintf("%.1f%%", r.WinRate*100),
-			)
+	// Output
+	switch output.Format(appConfig.General.Output) {
+	case output.FormatJSON:
+		meta := output.NewMeta("pairs")
+		meta.Market = activeMarket.ID
+		meta.DurationMs = time.Since(startTime).Milliseconds()
+		env := output.Envelope{
+			Meta:    meta,
+			Results: results,
 		}
-		tw.Render()
+		return output.WriteEnvelope(os.Stdout, env)
+
+	default:
+		if len(results) > 0 {
+			cs := activeMarket.CurrencySymbol
+			fmt.Println("\n📊 Summary:")
+			tw := output.NewTableWriter(os.Stdout)
+			tw.SetHeaders("Pair", "Hedge Ratio", "Trades", "Profit", "Win Rate")
+			for _, r := range results {
+				tw.AddRow(
+					fmt.Sprintf("%s/%s", r.Stock1, r.Stock2),
+					fmt.Sprintf("%.4f", r.HedgeRatio),
+					fmt.Sprintf("%d", len(r.Trades)),
+					fmt.Sprintf("%s%.2f", cs, r.TotalProfit),
+					fmt.Sprintf("%.1f%%", r.WinRate*100),
+				)
+			}
+			tw.Render()
+		}
 	}
 
 	return nil

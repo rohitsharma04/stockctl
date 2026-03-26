@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rohitsharma04/stockctl/internal/backtest"
 	"github.com/rohitsharma04/stockctl/internal/output"
@@ -46,6 +47,7 @@ func init() {
 
 func runBacktest(cmd *cobra.Command, args []string) error {
 	cfg := appConfig.Backtest
+	startTime := time.Now()
 
 	// Parse range overrides
 	tpMin, tpMax, tpStep := cfg.TPMin, cfg.TPMax, cfg.TPStep
@@ -76,14 +78,14 @@ func runBacktest(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("loading entries: %w", err)
 	}
-	fmt.Printf("📊 Loaded %d breakout entries from %s\n", len(entries), btInput)
+	logf("📊 Loaded %d breakout entries from %s\n", len(entries), btInput)
 
 	if len(entries) == 0 {
 		return fmt.Errorf("no entries found in %s", btInput)
 	}
 
 	// Run optimization
-	fmt.Printf("⚙️  Optimizing TP: %.0f%%–%.0f%%, SL: %.0f%%–%.0f%% (TP ≥ %.0fx SL)...\n",
+	logf("⚙️  Optimizing TP: %.0f%%–%.0f%%, SL: %.0f%%–%.0f%% (TP ≥ %.0fx SL)...\n",
 		tpMin*100, tpMax*100, slMin*100, slMax*100, cfg.MinRewardRisk)
 
 	results := backtest.Optimize(entries, tpMin, tpMax, tpStep, slMin, slMax, slStep, cfg.MinRewardRisk, capital)
@@ -92,6 +94,28 @@ func runBacktest(cmd *cobra.Command, args []string) error {
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].FinalAmount > results[j].FinalAmount
 	})
+
+	cs := activeMarket.CurrencySymbol
+
+	// JSON output with envelope
+	if appConfig.General.Output == "json" {
+		type btResult struct {
+			Optimized []backtest.TradeResult   `json:"optimized"`
+			Metrics   []backtest.StrategyMetrics `json:"metrics"`
+		}
+		var metrics []backtest.StrategyMetrics
+		for tp := tpMin; tp <= tpMax+0.001; tp += tpStep {
+			metrics = append(metrics, backtest.EvaluateStrategy(entries, tp, 0.05))
+		}
+		meta := output.NewMeta("backtest")
+		meta.Market = activeMarket.ID
+		meta.DurationMs = time.Since(startTime).Milliseconds()
+		env := output.Envelope{
+			Meta:    meta,
+			Results: btResult{Optimized: results, Metrics: metrics},
+		}
+		return output.WriteEnvelope(os.Stdout, env)
+	}
 
 	// Summary
 	totalInit := 0.0
@@ -102,9 +126,9 @@ func runBacktest(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("\n📈 Performance Summary:\n")
-	fmt.Printf("   Total Initial Investment: ₹%.2f\n", totalInit)
-	fmt.Printf("   Total Final Amount:       ₹%.2f\n", totalFinal)
-	fmt.Printf("   Net Profit:               ₹%.2f\n", totalFinal-totalInit)
+	fmt.Printf("   Total Initial Investment: %s%.2f\n", cs, totalInit)
+	fmt.Printf("   Total Final Amount:       %s%.2f\n", cs, totalFinal)
+	fmt.Printf("   Net Profit:               %s%.2f\n", cs, totalFinal-totalInit)
 
 	// Top 10 performers
 	limit := 10
@@ -123,8 +147,8 @@ func runBacktest(cmd *cobra.Command, args []string) error {
 		tw.AddRow(
 			fmt.Sprintf("%.1f%%", r.TP*100),
 			fmt.Sprintf("%.1f%%", r.SL*100),
-			fmt.Sprintf("₹%.0f", r.TotalInit),
-			fmt.Sprintf("₹%.0f", r.FinalAmount),
+			fmt.Sprintf("%s%.0f", cs, r.TotalInit),
+			fmt.Sprintf("%s%.0f", cs, r.FinalAmount),
 			fmt.Sprintf("%.2f%%", ret),
 		)
 	}

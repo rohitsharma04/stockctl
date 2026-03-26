@@ -3,7 +3,6 @@ market = "us"  # us, india, japan, uk, germany, etc. (run 'stockctl markets' to 
 min_price = 5.0
 workers = 8
 output = "table"
-tickers_file = "us_stocks.csv"
 
 [screeners.breakout_caution]
 bollinger_period = 20

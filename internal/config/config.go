@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 
 	"github.com/BurntSushi/toml"
 )
@@ -73,6 +74,24 @@ type BacktestConfig struct {
 	MinRewardRisk  float64 `toml:"min_reward_risk"`
 }
 
+// StockctlDir returns the base directory for all stockctl data: ~/.stockctl/
+func StockctlDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".stockctl"
+	}
+	return filepath.Join(home, ".stockctl")
+}
+
+// DefaultConfigPath returns the default config file path.
+// Priority: $STOCKCTL_CONFIG env var → ~/.stockctl/config.toml
+func DefaultConfigPath() string {
+	if envPath := os.Getenv("STOCKCTL_CONFIG"); envPath != "" {
+		return envPath
+	}
+	return filepath.Join(StockctlDir(), "config.toml")
+}
+
 // Load reads and parses the TOML config file.
 // If the file doesn't exist, returns a config with sensible defaults.
 func Load(path string) (*Config, error) {
@@ -104,8 +123,7 @@ func setDefaults(cfg *Config) {
 	if cfg.General.Output == "" {
 		cfg.General.Output = "table"
 	}
-	// TickersFile defaults to empty — auto-resolve from universe
 	if cfg.General.Market == "" {
-		cfg.General.Market = "india"
+		cfg.General.Market = "us"
 	}
 }

@@ -20,11 +20,11 @@ sudo mv stockctl /usr/local/bin/
 Create your config file:
 
 ```bash
-mkdir -p ~/.config/stockctl
-cp config.toml ~/.config/stockctl/config.toml
+mkdir -p ~/.stockctl
+cp config.toml ~/.stockctl/config.toml
 ```
 
-Edit `~/.config/stockctl/config.toml` to set your default market and strategy thresholds.
+Edit `~/.stockctl/config.toml` to set your default market and strategy thresholds.
 
 Override path: set `STOCKCTL_CONFIG` env var or use `--config` flag.
 
@@ -68,10 +68,15 @@ The `--market` flag auto-appends the correct Yahoo Finance suffix to raw tickers
 ## Output
 
 - `--output table` — terminal table (default)
-- `--output json` — structured JSON to stdout
+- `--output json` — structured JSON envelope to stdout (`{meta, results, errors}`)
 - `--output csv` — writes to `/tmp/stockctl/run_<timestamp>_<id>/`
 
 Each run creates a unique output directory — files never overwrite.
+
+### Agent-friendly flags
+
+- `--quiet` / `-q` — suppress all progress output (agent mode)
+- `--min-score 0.8` — include near-miss stocks (default: 1.0 = only full passes)
 
 ## Agent Integration
 

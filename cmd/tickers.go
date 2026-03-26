@@ -2,8 +2,10 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/rohitsharma04/stockctl/internal/marketdata"
+	"github.com/rohitsharma04/stockctl/internal/output"
 	"github.com/spf13/cobra"
 )
 
@@ -12,16 +14,19 @@ var tickersCmd = &cobra.Command{
 	Short: "List the built-in ticker universe for a market",
 	Long: `Shows the embedded index constituents for the active market.
 
-Supported markets with built-in universes:
-  us      S&P 500 (503 tickers)
-  india   Nifty 500 (500 tickers)
-
-For other markets, use --tickers flag with the scan command.`,
+Every market has a built-in universe. Use 'stockctl markets' to see all.`,
 	RunE: runTickers,
 }
 
 func init() {
 	rootCmd.AddCommand(tickersCmd)
+}
+
+type tickersResult struct {
+	Market  string   `json:"market"`
+	Name    string   `json:"name"`
+	Count   int      `json:"count"`
+	Tickers []string `json:"tickers"`
 }
 
 func runTickers(cmd *cobra.Command, args []string) error {
@@ -38,13 +43,30 @@ func runTickers(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	fmt.Printf("📊 %s (%s): %d tickers\n", activeMarket.Name, mktID, len(tickers))
+	switch output.Format(appConfig.General.Output) {
+	case output.FormatJSON:
+		env := output.Envelope{
+			Meta: output.NewMeta("tickers"),
+			Results: tickersResult{
+				Market:  mktID,
+				Name:    activeMarket.Name,
+				Count:   len(tickers),
+				Tickers: tickers,
+			},
+		}
+		return output.WriteEnvelope(os.Stdout, env)
 
-	limit := 20
-	if len(tickers) < limit {
-		limit = len(tickers)
+	default:
+		fmt.Printf("📊 %s (%s): %d tickers\n\n", activeMarket.Name, mktID, len(tickers))
+		for i, t := range tickers {
+			if i > 0 && i%10 == 0 {
+				fmt.Println()
+			}
+			fmt.Printf("  %-12s", t)
+		}
+		fmt.Println()
 	}
-	fmt.Printf("   Sample: %v\n", tickers[:limit])
 
 	return nil
 }
+

@@ -9,6 +9,7 @@ import (
 
 	"github.com/rohitsharma04/stockctl/internal/config"
 	"github.com/rohitsharma04/stockctl/internal/marketdata"
+	"github.com/rohitsharma04/stockctl/internal/output"
 	"github.com/spf13/cobra"
 )
 
@@ -17,24 +18,11 @@ var (
 	outputFmt    string
 	marketID     string
 	verbose      bool
+	quiet        bool
 	appConfig    *config.Config
 	activeMarket marketdata.Market
 	runDir       string // unique per-run output directory
 )
-
-// defaultConfigPath returns the default config path:
-// 1. $STOCKCTL_CONFIG env var (if set)
-// 2. ~/.config/stockctl/config.toml
-func defaultConfigPath() string {
-	if envPath := os.Getenv("STOCKCTL_CONFIG"); envPath != "" {
-		return envPath
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "config.toml"
-	}
-	return filepath.Join(home, ".config", "stockctl", "config.toml")
-}
 
 // createRunDir creates a unique output directory under /tmp/stockctl/
 // Format: /tmp/stockctl/run_20260326_201500_a3f8/
@@ -50,6 +38,13 @@ func createRunDir() (string, error) {
 	return dir, nil
 }
 
+// logf prints to stderr unless --quiet is set.
+func logf(format string, a ...interface{}) {
+	if !quiet {
+		fmt.Fprintf(os.Stderr, format, a...)
+	}
+}
+
 var rootCmd = &cobra.Command{
 	Use:   "stockctl",
 	Short: "Stock analysis CLI — screeners, pairs trading, and backtesting",
@@ -60,11 +55,11 @@ It provides:
   • Pairs trading simulation (correlative hedging with z-score signals)
   • Backtesting engine (TP/SL optimization with Sharpe ratio analysis)
 
-Configuration: ~/.config/stockctl/config.toml (override: STOCKCTL_CONFIG env var or --config)
+Configuration: ~/.stockctl/config.toml (override: STOCKCTL_CONFIG env var or --config)
 Output files:  /tmp/stockctl/run_<timestamp>_<id>/ (unique per run, never overwrites)`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		// Skip config loading for the markets command
-		if cmd.Name() == "markets" {
+		if cmd.Name() == "markets" || cmd.Name() == "version" {
 			return nil
 		}
 
@@ -108,7 +103,40 @@ func Execute() {
 var marketsCmd = &cobra.Command{
 	Use:   "markets",
 	Short: "List all supported stock markets",
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
+		// Check output format (need to read flag directly since PersistentPreRunE skips for "markets")
+		outFmt := "table"
+		if cmd.Flags().Changed("output") {
+			outFmt = outputFmt
+		}
+
+		type marketInfo struct {
+			ID             string  `json:"id"`
+			Name           string  `json:"name"`
+			Suffix         string  `json:"suffix"`
+			Benchmark      string  `json:"benchmark"`
+			Currency       string  `json:"currency"`
+			CurrencySymbol string  `json:"currency_symbol"`
+			MinPrice       float64 `json:"min_price"`
+		}
+
+		if output.Format(outFmt) == output.FormatJSON {
+			var markets []marketInfo
+			for _, id := range marketdata.ListMarkets() {
+				m := marketdata.Markets[id]
+				markets = append(markets, marketInfo{
+					ID: m.ID, Name: m.Name, Suffix: m.Suffix,
+					Benchmark: m.Benchmark, Currency: m.Currency,
+					CurrencySymbol: m.CurrencySymbol, MinPrice: m.MinPrice,
+				})
+			}
+			env := output.Envelope{
+				Meta:    output.NewMeta("markets"),
+				Results: markets,
+			}
+			return output.WriteEnvelope(os.Stdout, env)
+		}
+
 		fmt.Println("Supported markets:")
 		fmt.Println()
 		for _, id := range marketdata.ListMarkets() {
@@ -116,13 +144,16 @@ var marketsCmd = &cobra.Command{
 			fmt.Printf("  %-14s %-25s suffix: %-5s  benchmark: %-12s  currency: %s\n",
 				m.ID, m.Name, m.Suffix, m.Benchmark, m.Currency)
 		}
+		return nil
 	},
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", defaultConfigPath(), "config file path")
+	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", config.DefaultConfigPath(), "config file path")
 	rootCmd.PersistentFlags().StringVarP(&outputFmt, "output", "o", "table", "output format: table, json, csv")
 	rootCmd.PersistentFlags().StringVarP(&marketID, "market", "m", "", "stock market: us, india, japan, uk, etc. (use 'stockctl markets' to list)")
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "verbose output")
+	rootCmd.PersistentFlags().BoolVarP(&quiet, "quiet", "q", false, "suppress all progress output (agent mode)")
 	rootCmd.AddCommand(marketsCmd)
 }
+

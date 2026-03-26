@@ -8,7 +8,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/rohitsharma04/stockctl/internal/config"
 	"github.com/rohitsharma04/stockctl/internal/indicators"
 	"github.com/rohitsharma04/stockctl/internal/marketdata"
 	"github.com/rohitsharma04/stockctl/internal/output"
@@ -69,23 +68,14 @@ type screenerInspection struct {
 
 func runInspect(cmd *cobra.Command, args []string) error {
 	ticker := args[0]
-
-	appConfig, err := config.Load(cfgFile)
-	if err != nil {
-		return fmt.Errorf("loading config: %w", err)
-	}
-
-	activeMarket, ok := marketdata.Markets[appConfig.General.Market]
-	if !ok {
-		return fmt.Errorf("unknown market: %s", appConfig.General.Market)
-	}
+	ctx := context.Background()
+	startTime := time.Now()
 
 	fullTicker := activeMarket.ApplySuffix(ticker)
 	provider := marketdata.NewYahooProvider(5)
-	ctx := context.Background()
 
 	// Fetch 5 years of daily data
-	fmt.Fprintf(os.Stderr, "📊 Fetching data for %s (%s)...\n", fullTicker, activeMarket.Name)
+	logf("📊 Fetching data for %s (%s)...\n", fullTicker, activeMarket.Name)
 	data, err := provider.GetHistory(ctx, fullTicker, "5y", "1d")
 	if err != nil {
 		return fmt.Errorf("fetching data for %s: %w", fullTicker, err)
@@ -167,9 +157,14 @@ func runInspect(cmd *cobra.Command, args []string) error {
 	// Output
 	switch output.Format(appConfig.General.Output) {
 	case output.FormatJSON:
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(result)
+		meta := output.NewMeta("inspect")
+		meta.Market = activeMarket.ID
+		meta.DurationMs = time.Since(startTime).Milliseconds()
+		env := output.Envelope{
+			Meta:    meta,
+			Results: result,
+		}
+		return output.WriteEnvelope(os.Stdout, env)
 
 	default:
 		cs := activeMarket.CurrencySymbol
@@ -226,3 +221,7 @@ func safeFloat(v float64) float64 {
 	}
 	return v
 }
+
+// keep json import used
+var _ = json.Marshal
+

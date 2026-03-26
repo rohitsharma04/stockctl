@@ -25,6 +25,7 @@ var (
 	minPrice    float64
 	workers     int
 	months      int
+	minScore    float64
 )
 
 var scanCmd = &cobra.Command{
@@ -53,12 +54,14 @@ func init() {
 	scanCmd.Flags().Float64Var(&minPrice, "min-price", 0, "minimum stock price (default from config)")
 	scanCmd.Flags().IntVar(&workers, "workers", 0, "number of concurrent workers (default from config)")
 	scanCmd.Flags().IntVar(&months, "months", 0, "months for descending-breakout (default from config)")
+	scanCmd.Flags().Float64Var(&minScore, "min-score", 1.0, "minimum score to include (0.0-1.0, default 1.0 = only full passes)")
 	rootCmd.AddCommand(scanCmd)
 }
 
 func runScan(cmd *cobra.Command, args []string) error {
 	strategy := args[0]
 	ctx := context.Background()
+	startTime := time.Now()
 
 	// Resolve config overrides
 	tf := appConfig.General.TickersFile
@@ -88,7 +91,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("no built-in universe for %s: %w\nUse --tickers to specify a CSV file, or run 'stockctl tickers' to see available markets", appConfig.General.Market, err)
 		}
-		fmt.Printf("📋 Loaded %d tickers from built-in %s universe\n", len(rawTickers), appConfig.General.Market)
+		logf("📋 Loaded %d tickers from built-in %s universe\n", len(rawTickers), appConfig.General.Market)
 	}
 
 	// Apply market suffix to each ticker
@@ -104,7 +107,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 		provider = marketdata.NewCachedProvider(yahoo)
 	}
 
-	fmt.Printf("🌍 Market: %s (%s)\n", activeMarket.Name, activeMarket.Currency)
+	logf("🌍 Market: %s (%s)\n", activeMarket.Name, activeMarket.Currency)
 
 	// Get registry
 	registry := screener.Registry(appConfig)
@@ -124,25 +127,52 @@ func runScan(cmd *cobra.Command, args []string) error {
 	}
 
 	// Fetch benchmark data for screeners that need it
-	fmt.Printf("📊 Fetching benchmark data (%s)...\n", activeMarket.Benchmark)
+	logf("📊 Fetching benchmark data (%s)...\n", activeMarket.Benchmark)
 	benchmarkData, err := provider.GetHistory(ctx, activeMarket.Benchmark, "5y", "1d")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "⚠️  Could not fetch benchmark: %v (relative strength checks will be skipped)\n", err)
+		logf("⚠️  Could not fetch benchmark: %v (relative strength checks will be skipped)\n", err)
 	}
 
 	// Run screening
 	if appConfig.General.Output == "csv" {
-		fmt.Printf("📂 Output directory: %s\n", runDir)
+		logf("📂 Output directory: %s\n", runDir)
 	}
+
+	var allResults []scanResult
+	var allErrors []output.ErrorInfo
+	totalScanned := len(tickers)
+	totalFailed := 0
+
 	for _, scr := range screeners {
-		fmt.Printf("\n🔍 Running %s screener on %d tickers (workers: %d)...\n", scr.Name(), len(tickers), w)
-		results := runScreener(ctx, scr, tickers, provider, benchmarkData, w)
+		logf("\n🔍 Running %s screener on %d tickers (workers: %d)...\n", scr.Name(), len(tickers), w)
+		results, errors := runScreener(ctx, scr, tickers, provider, benchmarkData, w)
+
+		totalFailed += len(errors)
+		allErrors = append(allErrors, errors...)
 
 		// Output results
-		fmt.Printf("✅ %s: %d stocks passed\n", scr.Name(), len(results))
-		if len(results) > 0 {
+		logf("✅ %s: %d stocks passed\n", scr.Name(), len(results))
+		allResults = append(allResults, results...)
+
+		if len(results) > 0 && appConfig.General.Output != "json" {
 			renderResults(scr.Name(), results, appConfig.General.Output)
 		}
+	}
+
+	// JSON output with envelope
+	if appConfig.General.Output == "json" {
+		meta := output.NewMeta("scan")
+		meta.Market = activeMarket.ID
+		meta.Strategy = strategy
+		meta.TickersScanned = totalScanned
+		meta.TickersFailed = totalFailed
+		meta.DurationMs = time.Since(startTime).Milliseconds()
+		env := output.Envelope{
+			Meta:    meta,
+			Results: allResults,
+			Errors:  allErrors,
+		}
+		return output.WriteEnvelope(os.Stdout, env)
 	}
 
 	return nil
@@ -157,7 +187,7 @@ type scanResult struct {
 }
 
 func runScreener(ctx context.Context, scr screener.Screener, tickers []string,
-	provider marketdata.Provider, benchmark []marketdata.OHLCV, workers int) []scanResult {
+	provider marketdata.Provider, benchmark []marketdata.OHLCV, workers int) ([]scanResult, []output.ErrorInfo) {
 
 	type job struct {
 		ticker string
@@ -165,6 +195,7 @@ func runScreener(ctx context.Context, scr screener.Screener, tickers []string,
 
 	jobs := make(chan job, len(tickers))
 	var results []scanResult
+	var errors []output.ErrorInfo
 	var mu sync.Mutex
 	var processed int64
 	total := int64(len(tickers))
@@ -178,8 +209,11 @@ func runScreener(ctx context.Context, scr screener.Screener, tickers []string,
 				data, err := provider.GetHistory(ctx, j.ticker, "5y", "1d")
 				if err != nil {
 					if verbose {
-						fmt.Fprintf(os.Stderr, "  ⚠ %s: %v\n", j.ticker, err)
+						logf("  ⚠ %s: %v\n", j.ticker, err)
 					}
+					mu.Lock()
+					errors = append(errors, output.ErrorInfo{Ticker: j.ticker, Error: err.Error()})
+					mu.Unlock()
 					atomic.AddInt64(&processed, 1)
 					continue
 				}
@@ -187,13 +221,16 @@ func runScreener(ctx context.Context, scr screener.Screener, tickers []string,
 				result, err := scr.Screen(ctx, data, benchmark)
 				if err != nil {
 					if verbose {
-						fmt.Fprintf(os.Stderr, "  ⚠ %s: %v\n", j.ticker, err)
+						logf("  ⚠ %s: %v\n", j.ticker, err)
 					}
+					mu.Lock()
+					errors = append(errors, output.ErrorInfo{Ticker: j.ticker, Error: err.Error()})
+					mu.Unlock()
 					atomic.AddInt64(&processed, 1)
 					continue
 				}
 
-				if result.Pass {
+				if result.Score >= minScore {
 					passed := 0
 					for _, f := range result.Filters {
 						if f.Pass {
@@ -213,7 +250,7 @@ func runScreener(ctx context.Context, scr screener.Screener, tickers []string,
 
 				count := atomic.AddInt64(&processed, 1)
 				if count%50 == 0 || count == total {
-					fmt.Printf("  📈 Progress: %d/%d\n", count, total)
+					logf("  📈 Progress: %d/%d\n", count, total)
 				}
 			}
 		}()
@@ -225,13 +262,14 @@ func runScreener(ctx context.Context, scr screener.Screener, tickers []string,
 	close(jobs)
 	wg.Wait()
 
-	return results
+	return results, errors
 }
 
 func renderResults(strategyName string, results []scanResult, format string) {
 	switch output.Format(format) {
 	case output.FormatJSON:
-		output.WriteJSON(os.Stdout, results)
+		// Handled by envelope in runScan
+		return
 
 	case output.FormatCSV:
 		filename := filepath.Join(runDir, fmt.Sprintf("%s_%s.csv", strategyName, time.Now().Format("2006-01-02_150405")))
@@ -243,7 +281,7 @@ func renderResults(strategyName string, results []scanResult, format string) {
 		if err := output.WriteCSV(filename, headers, rows); err != nil {
 			fmt.Fprintf(os.Stderr, "Error writing CSV: %v\n", err)
 		} else {
-			fmt.Printf("📁 Results saved to %s\n", filename)
+			logf("📁 Results saved to %s\n", filename)
 		}
 
 	default: // table
@@ -312,3 +350,4 @@ func loadTickers(path string) ([]string, error) {
 	}
 	return tickers, scanner.Err()
 }
+
