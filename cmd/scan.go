@@ -75,9 +75,20 @@ func runScan(cmd *cobra.Command, args []string) error {
 	}
 
 	// Load tickers
-	rawTickers, err := loadTickers(tf)
-	if err != nil {
-		return fmt.Errorf("loading tickers: %w", err)
+	var rawTickers []string
+	var err error
+	if tf != "" {
+		rawTickers, err = loadTickers(tf)
+		if err != nil {
+			return fmt.Errorf("loading tickers: %w", err)
+		}
+	} else {
+		// Auto-resolve from universe
+		rawTickers, err = marketdata.FetchUniverse(appConfig.General.Market, false)
+		if err != nil {
+			return fmt.Errorf("auto-resolving tickers for %s: %w\nUse --tickers to specify a CSV file", appConfig.General.Market, err)
+		}
+		fmt.Printf("📋 Auto-loaded %d tickers from %s universe\n", len(rawTickers), appConfig.General.Market)
 	}
 
 	// Apply market suffix to each ticker
@@ -86,8 +97,12 @@ func runScan(cmd *cobra.Command, args []string) error {
 		tickers[i] = activeMarket.ApplySuffix(t)
 	}
 
-	// Create provider
-	provider := marketdata.NewYahooProvider(5)
+	// Create provider (cached for "all" to avoid redundant API calls)
+	yahoo := marketdata.NewYahooProvider(5)
+	var provider marketdata.Provider = yahoo
+	if strategy == "all" {
+		provider = marketdata.NewCachedProvider(yahoo)
+	}
 
 	fmt.Printf("🌍 Market: %s (%s)\n", activeMarket.Name, activeMarket.Currency)
 
@@ -142,7 +157,7 @@ type scanResult struct {
 }
 
 func runScreener(ctx context.Context, scr screener.Screener, tickers []string,
-	provider *marketdata.YahooProvider, benchmark []marketdata.OHLCV, workers int) []scanResult {
+	provider marketdata.Provider, benchmark []marketdata.OHLCV, workers int) []scanResult {
 
 	type job struct {
 		ticker string
