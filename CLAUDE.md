@@ -8,9 +8,16 @@ Go CLI for stock screening, pairs trading, and backtesting across 19 global mark
 # Build
 go build -o stockctl .
 
-# Scan stocks
-stockctl scan <strategy> --tickers stocks.csv --market us --output json
-stockctl scan all --market india --tickers nifty500.csv --output json
+# Scan stocks (zero-config: auto-fetches ticker universe)
+stockctl scan breakout-caution --market us --output json
+stockctl scan all --market india --output json
+
+# With explicit ticker file
+stockctl scan all --tickers nifty500.csv --market india --output json
+
+# Fetch/refresh ticker universe
+stockctl tickers --market us
+stockctl tickers --market india --force
 
 # Inspect a single stock
 stockctl inspect AAPL --output json

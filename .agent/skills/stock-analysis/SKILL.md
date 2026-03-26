@@ -45,14 +45,14 @@ Scans a universe of tickers against technical analysis filters. Runs concurrentl
 
 **Usage:**
 ```bash
-# Scan US stocks (default market)
-stockctl scan breakout-caution --tickers stocks.csv
+# Zero-config scan (auto-fetches S&P 500 tickers)
+stockctl scan breakout-caution --output json
 
-# Scan Indian NSE stocks
-stockctl scan all --market india --tickers nifty500.csv
+# Scan Indian NSE stocks (auto-fetches Nifty 500)
+stockctl scan all --market india --output json
 
-# JSON output for programmatic use
-stockctl scan high-performance --tickers stocks.csv --output json
+# With explicit ticker file
+stockctl scan high-performance --tickers custom_stocks.csv --output json
 
 # Increase concurrency
 stockctl scan all --tickers stocks.csv --workers 16
@@ -75,7 +75,34 @@ stockctl scan all --tickers stocks.csv --workers 16
 
 Each result includes a `score` (0.0–1.0 = filters_passed/total_filters). A stock passes only when score = 1.0.
 
-### 2. `stockctl pairs` — Pairs Trading Analysis
+### 2. `stockctl tickers` — Fetch/Refresh Ticker Universe
+
+Downloads index constituents and caches them locally (7-day TTL).
+
+**Supported markets:**
+| Market | Index | Source |
+|---|---|---|
+| `us` | S&P 500 | Wikipedia |
+| `india` | Nifty 500 | NSE CSV |
+| `japan` | Nikkei 225 | Wikipedia |
+| `uk` | FTSE 100 | Wikipedia |
+| `germany` | DAX 40 | Wikipedia |
+
+**Usage:**
+```bash
+# Fetch for current market
+stockctl tickers --market india
+
+# Force re-download
+stockctl tickers --market us --force
+
+# Fetch all supported markets
+stockctl tickers --market all
+```
+
+Cache location: `~/.config/stockctl/universes/<market>.csv`
+
+### 3. `stockctl pairs` — Pairs Trading Analysis
 
 Finds highly correlated stock pairs and simulates mean-reversion trading using z-score signals.
 
