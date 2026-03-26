@@ -15,8 +15,9 @@ stockctl
 .DS_Store
 Thumbs.db
 
-# Data files
+# Data files (but NOT embedded universes)
 *.csv
+!internal/marketdata/data/universes/*.csv
 
 # Config with credentials (keep config.toml as template)
 # config.local.toml

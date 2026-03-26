@@ -20,6 +20,22 @@ type UniverseIndex struct {
 var EmbeddedUniverses = []UniverseIndex{
 	{MarketID: "us", Name: "S&P 500", File: "data/universes/us.csv"},
 	{MarketID: "india", Name: "Nifty 500", File: "data/universes/india.csv"},
+	{MarketID: "japan", Name: "Nikkei 225 (Top 100)", File: "data/universes/japan.csv"},
+	{MarketID: "uk", Name: "FTSE 100", File: "data/universes/uk.csv"},
+	{MarketID: "germany", Name: "DAX 40", File: "data/universes/germany.csv"},
+	{MarketID: "france", Name: "CAC 40", File: "data/universes/france.csv"},
+	{MarketID: "canada", Name: "S&P/TSX 60", File: "data/universes/canada.csv"},
+	{MarketID: "australia", Name: "ASX 50", File: "data/universes/australia.csv"},
+	{MarketID: "hong-kong", Name: "Hang Seng", File: "data/universes/hong-kong.csv"},
+	{MarketID: "china", Name: "SSE 50", File: "data/universes/china.csv"},
+	{MarketID: "korea", Name: "KOSPI 50", File: "data/universes/korea.csv"},
+	{MarketID: "singapore", Name: "STI 30", File: "data/universes/singapore.csv"},
+	{MarketID: "brazil", Name: "Ibovespa (Top 88)", File: "data/universes/brazil.csv"},
+	{MarketID: "taiwan", Name: "TWSE 50", File: "data/universes/taiwan.csv"},
+	{MarketID: "italy", Name: "FTSE MIB", File: "data/universes/italy.csv"},
+	{MarketID: "spain", Name: "IBEX 35", File: "data/universes/spain.csv"},
+	{MarketID: "sweden", Name: "OMX 30", File: "data/universes/sweden.csv"},
+	{MarketID: "switzerland", Name: "SMI 20", File: "data/universes/switzerland.csv"},
 }
 
 // GetUniverse returns the embedded ticker list for a market.
