@@ -83,12 +83,12 @@ func runScan(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("loading tickers: %w", err)
 		}
 	} else {
-		// Auto-resolve from universe
-		rawTickers, err = marketdata.FetchUniverse(appConfig.General.Market, false)
+		// Auto-resolve from embedded universe
+		rawTickers, err = marketdata.GetUniverse(appConfig.General.Market)
 		if err != nil {
-			return fmt.Errorf("auto-resolving tickers for %s: %w\nUse --tickers to specify a CSV file", appConfig.General.Market, err)
+			return fmt.Errorf("no built-in universe for %s: %w\nUse --tickers to specify a CSV file, or run 'stockctl tickers' to see available markets", appConfig.General.Market, err)
 		}
-		fmt.Printf("📋 Auto-loaded %d tickers from %s universe\n", len(rawTickers), appConfig.General.Market)
+		fmt.Printf("📋 Loaded %d tickers from built-in %s universe\n", len(rawTickers), appConfig.General.Market)
 	}
 
 	// Apply market suffix to each ticker

@@ -74,19 +74,24 @@ type BacktestConfig struct {
 }
 
 // Load reads and parses the TOML config file.
+// If the file doesn't exist, returns a config with sensible defaults.
 func Load(path string) (*Config, error) {
+	cfg := &Config{}
 	data, err := os.ReadFile(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			setDefaults(cfg)
+			return cfg, nil
+		}
 		return nil, err
 	}
 
-	var cfg Config
-	if err := toml.Unmarshal(data, &cfg); err != nil {
+	if err := toml.Unmarshal(data, cfg); err != nil {
 		return nil, err
 	}
 
-	setDefaults(&cfg)
-	return &cfg, nil
+	setDefaults(cfg)
+	return cfg, nil
 }
 
 func setDefaults(cfg *Config) {
@@ -99,9 +104,7 @@ func setDefaults(cfg *Config) {
 	if cfg.General.Output == "" {
 		cfg.General.Output = "table"
 	}
-	if cfg.General.TickersFile == "" {
-		cfg.General.TickersFile = "us_stocks.csv"
-	}
+	// TickersFile defaults to empty — auto-resolve from universe
 	if cfg.General.Market == "" {
 		cfg.General.Market = "us"
 	}
