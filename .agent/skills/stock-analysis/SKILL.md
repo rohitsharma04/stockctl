@@ -5,35 +5,40 @@ description: Scan stocks for breakout/momentum signals, run pairs trading analys
 
 # Stock Analysis Skill
 
-`stockctl` is a CLI for stock screening, pairs trading, and backtesting across **19 global markets** with **1,721 built-in tickers**. No configuration needed — just pick a market and scan.
+`stockctl` is a CLI for stock screening, pairs trading, and backtesting across **19 global markets** with **1,821 built-in tickers**. No configuration needed — just pick a market and scan.
 
 ## Quick Start
 
 ```bash
 # Scan US stocks — zero config, tickers are built in
-stockctl scan all --output json
+stockctl scan all --output json --quiet
 
 # Scan Indian stocks
-stockctl scan breakout-caution -m india --output json
+stockctl scan breakout-caution -m india --output json --quiet
+
+# Include near-miss stocks (score ≥ 80%)
+stockctl scan all --min-score 0.8 --output json --quiet
 
 # Deep-analyze a single stock
 stockctl inspect AAPL --output json
 
-# Inspect an Indian stock
-stockctl inspect RELIANCE -m india --output json
+# Version & capabilities
+stockctl version --output json
 ```
 
 ## Configuration
 
-Config at `~/.config/stockctl/config.toml` (optional — sensible defaults are built in).
+Config at `~/.stockctl/config.toml` (optional — sensible defaults are built in).
 Override with `--config` flag or `STOCKCTL_CONFIG` env var.
+
+Data directory: `~/.stockctl/` (config, cache)
 
 ## Market Selection
 
 Every command supports `-m / --market` to target a specific exchange:
 
 ```bash
-stockctl markets   # List all 19 supported markets
+stockctl markets --output json   # List all 19 supported markets
 ```
 
 The market determines:
@@ -61,8 +66,8 @@ Every market has a pre-loaded ticker universe embedded in the binary. **No `--ti
 | `singapore` | STI 30 | 30 | `switzerland` | SMI 20 | 20 |
 
 ```bash
-# List tickers for any market
-stockctl tickers -m japan
+# List tickers for any market (full list, JSON supported)
+stockctl tickers -m japan --output json
 stockctl tickers -m uk
 ```
 
@@ -82,15 +87,20 @@ Scans tickers against technical analysis filters. Runs concurrently with scored 
 | `high-performance` | Sustained uptrend | Golden cross, 2x from 52-week low, monotonic SMA200, consistent new highs | 8 |
 | `stellar-breakout` | Volume explosion | Weekly volume spike, 61.8% Fibonacci level, Heikin-Ashi bullish confirmation | 6 |
 | `descending-breakout` | Chart pattern breakout | Monthly descending triangle trendline break with volume confirmation | 4 |
-| `all` | Run all above | — | 24 |
+| `rsi-bounce` | RSI oversold recovery | RSI(14) crossed above 30, RSI in 30–60 range, price > SMA(50), volume spike | 4 |
+| `macd-crossover` | MACD bullish crossover | MACD > signal in last 3 days, histogram positive, price > SMA(200), volume ok | 4 |
+| `all` | Run all above | — | 32 |
 
 **Usage:**
 ```bash
 # Zero-config — scans built-in S&P 500
-stockctl scan breakout-caution --output json
+stockctl scan breakout-caution --output json --quiet
 
 # Scan Indian NSE — built-in Nifty 500
-stockctl scan all -m india --output json
+stockctl scan all -m india --output json --quiet
+
+# Include near-miss stocks (score ≥ 80%)
+stockctl scan rsi-bounce --min-score 0.8 --output json --quiet
 
 # Scan Japanese market
 stockctl scan high-performance -m japan --output json
@@ -99,7 +109,7 @@ stockctl scan high-performance -m japan --output json
 stockctl scan stellar-breakout --tickers custom.csv --output json
 
 # Increase concurrency
-stockctl scan all --workers 16 --output json
+stockctl scan all --workers 16 --output json --quiet
 ```
 
 **Flags:**
@@ -109,22 +119,36 @@ stockctl scan all --workers 16 --output json
 | `--market / -m` | `us` | Target market |
 | `--workers` | `8` | Concurrent workers |
 | `--output / -o` | `table` | `table`, `json`, `csv` |
+| `--min-score` | `1.0` | Minimum score to include (0.0–1.0). Use `0.8` for near-misses |
 | `--min-price` | from market | Minimum stock price filter |
+| `--quiet / -q` | `false` | Suppress all progress output (agent mode) |
+| `--no-cache` | `false` | Bypass disk cache |
 | `--verbose / -v` | `false` | Show per-ticker errors |
 
-**Output (JSON):**
+**Output (JSON envelope):**
 ```json
-[
-  {"ticker": "AAPL", "strategy": "breakout-caution", "score": 1.0, "filters_passed": 6, "total_filters": 6},
-  {"ticker": "NVDA", "strategy": "breakout-caution", "score": 1.0, "filters_passed": 6, "total_filters": 6}
-]
+{
+  "meta": {
+    "command": "scan",
+    "market": "us",
+    "strategy": "breakout-caution",
+    "tickers_scanned": 503,
+    "tickers_failed": 5,
+    "duration_ms": 45000,
+    "timestamp": "2026-03-26T17:00:00Z"
+  },
+  "results": [
+    {"ticker": "AAPL", "strategy": "breakout-caution", "score": 1.0, "filters_passed": 6, "total_filters": 6}
+  ],
+  "errors": [
+    {"ticker": "XYZ", "error": "no data returned"}
+  ]
+}
 ```
-
-Each result includes `score` (0.0–1.0 = filters_passed / total_filters). A stock passes only when score = 1.0.
 
 ### 2. `stockctl inspect <ticker>` — Single Stock Deep Analysis
 
-Fetches 5 years of daily data and runs all indicators + all 4 screeners with per-filter breakdown.
+Fetches 5 years of daily data and runs all indicators + all 6 screeners with per-filter breakdown.
 
 **Usage:**
 ```bash
@@ -136,34 +160,16 @@ stockctl inspect 7203 -m japan --output json
 **Output includes:**
 - **Price**: close, open, high, low, volume, 52-week high/low
 - **Indicators**: SMA(50), SMA(200), Bollinger Bands, ATR(14), Heikin-Ashi, Momentum
-- **Screeners**: All 4 strategies with pass/fail, score, and per-filter detail
-
-**JSON output (excerpt):**
-```json
-{
-  "ticker": "AAPL",
-  "price": {"close": 256.11, "high_52w": 286.19, "low_52w": 172.42},
-  "indicators": {"sma_50": 260.57, "sma_200": 247.84, "bollinger_upper": 267.03},
-  "screeners": [
-    {
-      "name": "breakout-caution", "pass": false, "score": 0.5,
-      "filters": [
-        {"name": "min_price", "pass": true, "detail": "$256.11"},
-        {"name": "bollinger_breakout", "pass": false, "detail": "high 257.00 vs upper band 267.03"}
-      ]
-    }
-  ]
-}
-```
+- **Screeners**: All 6 strategies with pass/fail, score, and per-filter detail
 
 ### 3. `stockctl tickers` — List Built-in Universes
 
-Shows the embedded ticker universe for the active market.
+Shows the full embedded ticker universe for the active market.
 
 ```bash
-stockctl tickers             # US (default)
-stockctl tickers -m india    # Nifty 500
-stockctl tickers -m germany  # DAX 40
+stockctl tickers --output json         # US (default)
+stockctl tickers -m india --output json  # Nifty 500
+stockctl tickers -m germany             # DAX 40 (table)
 ```
 
 ### 4. `stockctl pairs` — Pairs Trading Analysis
@@ -196,29 +202,67 @@ stockctl pairs -m india --threshold 0.6 --z-threshold 1.5
 
 Grid-searches take-profit and stop-loss combinations for optimal exit parameters.
 
+**Two modes:**
 ```bash
+# From CSV file
 stockctl backtest --input breakout_signals.csv
+
+# Direct from scan (no CSV needed!)
+stockctl backtest --strategy breakout-caution -m us --output json
+stockctl backtest --strategy all -m india --output json
+
+# Custom ranges
 stockctl backtest --input signals.csv --tp-range 0.10:0.30 --sl-range 0.02:0.08
 ```
 
-### 6. `stockctl markets` — List All Markets
+### 6. `stockctl cache` — Manage Disk Cache
+
+Market data is cached to `~/.stockctl/cache/` (24-hour TTL) to avoid redundant API calls.
 
 ```bash
-stockctl markets
+stockctl cache stats --output json   # View cache size and age
+stockctl cache clear                 # Clear all cached data
+stockctl cache clear -m india        # Clear only Indian market data
+```
+
+### 7. `stockctl markets` — List All Markets
+
+```bash
+stockctl markets --output json
 ```
 
 Shows all 19 markets with Yahoo Finance suffix, benchmark index, currency, and min price.
+
+### 8. `stockctl version` — Version & Capabilities
+
+```bash
+stockctl version --output json
+```
+
+Returns version, Go version, available strategies, markets, and total ticker count.
 
 ## Global Flags
 
 | Flag | Short | Default | Description |
 |---|---|---|---|
-| `--config` | | `~/.config/stockctl/config.toml` | Config file path |
+| `--config` | | `~/.stockctl/config.toml` | Config file path |
 | `--market` | `-m` | `us` | Target stock market |
 | `--output` | `-o` | `table` | Output format: `table`, `json`, `csv` |
+| `--quiet` | `-q` | `false` | Suppress stderr (agent mode) |
+| `--no-cache` | | `false` | Bypass disk cache |
 | `--verbose` | `-v` | `false` | Show detailed errors |
 
-## Output Directory
+## Output Format
+
+All commands support `--output json` and return a **standard envelope**:
+
+```json
+{
+  "meta": {"command": "...", "market": "...", "duration_ms": 123, "timestamp": "..."},
+  "results": ...,
+  "errors": [...]
+}
+```
 
 CSV/table exports are written to a **unique per-run temp directory**:
 ```
@@ -228,17 +272,18 @@ Never overwrites files or pollutes the working directory.
 
 ## Tips for Agents
 
-1. **Always use `--output json`** for programmatic consumption
+1. **Always use `--output json --quiet`** for programmatic consumption (structured envelope, no stderr noise)
 2. **Use `-m <market>`** instead of manually appending suffixes
 3. **No `--tickers` needed** — every market has a built-in universe
-4. **`scan all` runs all 4 screeners** — stocks appearing in multiple are stronger signals
-5. **For Indian stocks**, use `-m india` (NSE) or `-m india-bse` (BSE)
-6. **Rate limiting is built-in** — no need to add delays between calls
-7. **Can be run from any directory** — no need to `cd` anywhere
-8. **Scored results**: `score` (0–1) and `filters_passed`/`total_filters` rank near-misses
-9. **Cross-strategy analysis**: Compare scores across strategies to find strongest setups
+4. **`scan all` runs all 6 screeners** — stocks appearing in multiple are stronger signals
+5. **Use `--min-score 0.8`** to surface near-miss stocks that might pass tomorrow
+6. **For Indian stocks**, use `-m india` (NSE) or `-m india-bse` (BSE)
+7. **Rate limiting is built-in** — no need to add delays between calls
+8. **Disk cache (24h)** avoids redundant API calls — use `--no-cache` to force refresh
+9. **`backtest --strategy`** runs scan→backtest in one step, no CSV intermediary needed
 10. **Use `inspect` first** for single-stock deep analysis before running broad scans
-11. **Output files** go to `/tmp/stockctl/run_<ts>_<id>/` — check stderr for path
+11. **Check `meta.tickers_failed`** in scan output to detect data quality issues
+12. **Use `version --output json`** to discover available strategies and markets
 
 ## Cross-References
 
