@@ -35,13 +35,13 @@ Scans a universe of tickers against technical analysis filters. Runs concurrentl
 
 **Strategies:**
 
-| Strategy | Signal | Key Filters |
-|---|---|---|
-| `breakout-caution` | Bollinger Band breakout | Price > upper band, volume > 1.5x avg, relative strength > benchmark |
-| `high-performance` | Sustained uptrend | Golden cross, 2x from 52-week low, monotonic SMA200, consistent new highs |
-| `stellar-breakout` | Volume explosion | Weekly volume spike, 61.8% Fibonacci level, Heikin-Ashi bullish confirmation |
-| `descending-breakout` | Chart pattern breakout | Monthly descending triangle trendline break with volume confirmation |
-| `all` | Run all above | — |
+| Strategy | Signal | Key Filters | Filter Count |
+|---|---|---|---|
+| `breakout-caution` | Bollinger Band breakout | Price > upper band, volume > 1.5x avg, relative strength > benchmark | 6 |
+| `high-performance` | Sustained uptrend | Golden cross, 2x from 52-week low, monotonic SMA200, consistent new highs | 8 |
+| `stellar-breakout` | Volume explosion | Weekly volume spike, 61.8% Fibonacci level, Heikin-Ashi bullish confirmation | 6 |
+| `descending-breakout` | Chart pattern breakout | Monthly descending triangle trendline break with volume confirmation | 4 |
+| `all` | Run all above | — | — |
 
 **Usage:**
 ```bash
@@ -68,10 +68,12 @@ stockctl scan all --tickers stocks.csv --workers 16
 **Output (JSON):**
 ```json
 [
-  {"ticker": "AAPL", "strategy": "breakout-caution"},
-  {"ticker": "NVDA", "strategy": "breakout-caution"}
+  {"ticker": "AAPL", "strategy": "breakout-caution", "score": 1.0, "filters_passed": 6, "total_filters": 6},
+  {"ticker": "NVDA", "strategy": "breakout-caution", "score": 1.0, "filters_passed": 6, "total_filters": 6}
 ]
 ```
+
+Each result includes a `score` (0.0–1.0 = filters_passed/total_filters). A stock passes only when score = 1.0.
 
 ### 2. `stockctl pairs` — Pairs Trading Analysis
 
@@ -179,4 +181,13 @@ Tickers should be **raw symbols without market suffix** (e.g., `RELIANCE` not `R
 5. **Rate limiting is built-in** — no need to add delays between calls
 6. **Output files go to `/tmp/stockctl/run_<ts>_<id>/`** — never pollutes the working directory
 7. **Can be run from any directory** — no need to `cd` anywhere first
+8. **Scored results**: Each stock gets `score` (0.0–1.0) and `filters_passed`/`total_filters` — use these to rank near-misses
+9. **Cross-strategy analysis**: When using `scan all`, compare scores across strategies to identify the strongest setups
+
+## Cross-References
+
+These docs are also referenced by:
+- `CLAUDE.md` (Claude Code) — auto-read at session start
+- `AGENTS.md` (Codex) — read before every task
+- `.agent/skills/stock-analysis/SKILL.md` (Gemini CLI) — this file
 
