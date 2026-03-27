@@ -22,7 +22,6 @@ This document provides essential context for AI agents and developers modifying 
     - `backtest/`: TP/SL optimization engine.
     - `output/`: Formatters for JSON, CSV, and Table output.
     - `config/`: TOML configuration management.
-- `legacy/`: Archived Python scripts for reference.
 
 ## Build & Test
 

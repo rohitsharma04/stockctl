@@ -101,7 +101,6 @@ internal/
   output/       Table, JSON, CSV formatters
 config.toml     Default configuration template
 .agent/         AI agent skill + workflow definitions
-legacy/         Original Python scripts (archived)
 ```
 
 ## License
