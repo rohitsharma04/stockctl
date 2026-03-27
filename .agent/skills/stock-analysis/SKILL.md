@@ -1,6 +1,6 @@
 ---
 name: stock-analysis
-description: Scan stocks for breakout/momentum signals, run pairs trading analysis, and backtest trading strategies using the stockctl CLI
+description: Technical analysis CLI for global stock screening (1,821 tickers, 7 strategies), pairs correlation analysis, and TP/SL strategy backtesting across 19 markets.
 ---
 
 # Stock Analysis Skill
@@ -284,9 +284,3 @@ Never overwrites files or pollutes the working directory.
 10. **Use `inspect` first** for single-stock deep analysis before running broad scans
 11. **Check `meta.tickers_failed`** in scan output to detect data quality issues
 12. **Use `version --output json`** to discover available strategies and markets
-
-## Cross-References
-
-- `CLAUDE.md` (Claude Code) — auto-read at session start
-- `AGENTS.md` (Codex) — read before every task
-- `.agent/skills/stock-analysis/SKILL.md` (Gemini CLI) — this file
