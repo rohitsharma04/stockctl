@@ -2,6 +2,7 @@ package screener
 
 import (
 	"context"
+	"math"
 
 	"github.com/rohitsharma04/stockctl/internal/config"
 	"github.com/rohitsharma04/stockctl/internal/marketdata"
@@ -23,11 +24,21 @@ type ScreenResult struct {
 	Filters []FilterResult `json:"filters"`
 }
 
+// sanitizeFloat replaces NaN and Inf with 0 for JSON compatibility.
+func sanitizeFloat(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0
+	}
+	return v
+}
+
 // NewScreenResult builds a ScreenResult from a list of filter results.
 func NewScreenResult(filters []FilterResult) *ScreenResult {
 	passed := 0
-	for _, f := range filters {
-		if f.Pass {
+	for i := range filters {
+		filters[i].Value = sanitizeFloat(filters[i].Value)
+		filters[i].Threshold = sanitizeFloat(filters[i].Threshold)
+		if filters[i].Pass {
 			passed++
 		}
 	}

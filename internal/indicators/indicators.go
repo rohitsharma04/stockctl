@@ -5,6 +5,7 @@ package indicators
 
 import (
 	"math"
+	"sync"
 
 	"github.com/cinar/indicator/v2/helper"
 	"github.com/cinar/indicator/v2/momentum"
@@ -301,8 +302,18 @@ func MACD(closes []float64) ([]float64, []float64) {
 	macd := trend.NewMacd[float64]()
 	macdCh, signalCh := macd.Compute(helper.SliceToChan(closes))
 
-	macdLine := helper.ChanToSlice(macdCh)
-	signalLine := helper.ChanToSlice(signalCh)
+	// Drain both channels concurrently to avoid deadlock.
+	// The cinar pipeline produces values on both channels in lockstep;
+	// blocking on one while the other is un-drained causes a deadlock.
+	var macdLine, signalLine []float64
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		signalLine = helper.ChanToSlice(signalCh)
+	}()
+	macdLine = helper.ChanToSlice(macdCh)
+	wg.Wait()
 
 	// The MACD idle period (26-1 + 9-1 = 34 for signal)
 	macdIdle := macd.Ema2.IdlePeriod() // 25 (for MACD line)
