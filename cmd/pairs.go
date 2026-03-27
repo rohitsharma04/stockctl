@@ -86,11 +86,7 @@ func runPairs(cmd *cobra.Command, args []string) error {
 		stocks[i] = activeMarket.ApplySuffix(stocks[i])
 	}
 
-	yahoo := marketdata.NewYahooProvider(5)
-	var provider marketdata.Provider = yahoo
-	if !noCache {
-		provider = marketdata.NewDiskCachedProvider(yahoo, 24*time.Hour)
-	}
+	provider := marketdata.BuildProvider(noCache)
 
 	// Download data for all stocks
 	logf("🌍 Market: %s (%s)\n", activeMarket.Name, activeMarket.Currency)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,27 +15,38 @@ import (
 
 // DiskCachedProvider wraps a Provider with file-based caching.
 // Each (symbol, period, interval) is stored as a gob file in ~/.stockctl/cache/.
-// TTL defaults to 24 hours for daily data.
+//
+// On every call, the provider:
+//  1. Reads existing cache to find the last bar date
+//  2. Fetches only the delta (with 3-day overlap for corrections/splits)
+//  3. Merges new bars into the cache (overwrite overlap, append new)
+//  4. Returns the merged data
+//
+// If the upstream fetch fails, stale cached data is returned instead of an error.
 type DiskCachedProvider struct {
 	inner    Provider
 	cacheDir string
-	ttl      time.Duration
 }
 
-// diskCacheEntry stores OHLCV data with a fetch timestamp.
+// diskCacheEntry stores OHLCV data with metadata for delta computation.
 type diskCacheEntry struct {
-	FetchedAt time.Time
-	Data      []OHLCV
+	FetchedAt   time.Time
+	LastBarDate time.Time // Date of the most recent bar in cache
+	OrigPeriod  string    // Original period requested (e.g., "5y")
+	Data        []OHLCV
 }
+
+// overlapDays is the number of extra days fetched before LastBarDate
+// to catch corrections, splits, or late-arriving data.
+const overlapDays = 3
 
 // NewDiskCachedProvider creates a caching wrapper that persists data to disk.
-func NewDiskCachedProvider(inner Provider, ttl time.Duration) *DiskCachedProvider {
+func NewDiskCachedProvider(inner Provider) *DiskCachedProvider {
 	cacheDir := filepath.Join(config.StockctlDir(), "cache")
 	os.MkdirAll(cacheDir, 0755)
 	return &DiskCachedProvider{
 		inner:    inner,
 		cacheDir: cacheDir,
-		ttl:      ttl,
 	}
 }
 
@@ -44,27 +56,113 @@ func diskCacheFilename(symbol, period, interval string) string {
 	return fmt.Sprintf("%s_%s_%s.gob", safe, period, interval)
 }
 
-// GetHistory returns cached data if fresh, otherwise fetches and caches.
+// deltaPeriod calculates the Yahoo Finance period string needed to fetch
+// data from (lastBarDate - overlapDays) to now.
+// Returns a period like "5d", "1mo", "3mo", "6mo", "1y", or the original
+// period if the gap is too large.
+func deltaPeriod(lastBarDate time.Time, origPeriod string) string {
+	daysSince := int(math.Ceil(time.Since(lastBarDate).Hours()/24)) + overlapDays
+
+	switch {
+	case daysSince <= 5:
+		return "5d"
+	case daysSince <= 25:
+		return "1mo"
+	case daysSince <= 85:
+		return "3mo"
+	case daysSince <= 170:
+		return "6mo"
+	case daysSince <= 360:
+		return "1y"
+	case daysSince <= 720:
+		return "2y"
+	default:
+		// Gap too large — do a full refetch
+		return origPeriod
+	}
+}
+
+// mergeOHLCV merges new bars into existing cached bars.
+// Bars with the same date are overwritten (overlap correction).
+// The result is sorted by date ascending.
+func mergeOHLCV(cached, fresh []OHLCV) []OHLCV {
+	// Build a map keyed by date (truncated to day)
+	byDate := make(map[string]OHLCV, len(cached)+len(fresh))
+	order := make([]string, 0, len(cached)+len(fresh))
+
+	for _, bar := range cached {
+		key := bar.Date.Format("2006-01-02")
+		if _, exists := byDate[key]; !exists {
+			order = append(order, key)
+		}
+		byDate[key] = bar
+	}
+
+	for _, bar := range fresh {
+		key := bar.Date.Format("2006-01-02")
+		if _, exists := byDate[key]; !exists {
+			order = append(order, key)
+		}
+		// Overwrite — fresh data takes priority
+		byDate[key] = bar
+	}
+
+	// Sort dates
+	sortStrings(order)
+
+	merged := make([]OHLCV, 0, len(order))
+	for _, key := range order {
+		merged = append(merged, byDate[key])
+	}
+	return merged
+}
+
+// sortStrings sorts a string slice in place (date strings sort correctly).
+func sortStrings(s []string) {
+	// Simple insertion sort — fine for mostly-sorted date lists
+	for i := 1; i < len(s); i++ {
+		key := s[i]
+		j := i - 1
+		for j >= 0 && s[j] > key {
+			s[j+1] = s[j]
+			j--
+		}
+		s[j+1] = key
+	}
+}
+
+// GetHistory always fetches the delta, merges with cache, saves, and returns.
+// If upstream fails, returns stale cached data with a nil error.
 func (d *DiskCachedProvider) GetHistory(ctx context.Context, symbol, period, interval string) ([]OHLCV, error) {
 	path := filepath.Join(d.cacheDir, diskCacheFilename(symbol, period, interval))
 
-	// Try reading from cache
-	if entry, err := d.readCache(path); err == nil {
-		if time.Since(entry.FetchedAt) < d.ttl {
-			return entry.Data, nil
+	// Try reading existing cache
+	entry, cacheErr := d.readCache(path)
+
+	if cacheErr != nil || len(entry.Data) == 0 {
+		// No cache — full fetch
+		data, err := d.inner.GetHistory(ctx, symbol, period, interval)
+		if err != nil {
+			return nil, err
 		}
+		d.writeCache(path, data, period)
+		return data, nil
 	}
 
-	// Cache miss or stale — fetch from upstream
-	data, err := d.inner.GetHistory(ctx, symbol, period, interval)
+	// Cache exists — fetch delta
+	dp := deltaPeriod(entry.LastBarDate, period)
+	fresh, err := d.inner.GetHistory(ctx, symbol, dp, interval)
 	if err != nil {
-		return nil, err
+		// Stale-while-revalidate: return cached data on upstream failure
+		fmt.Fprintf(os.Stderr, "⚠ Delta fetch failed for %s, using cached data (%s): %v\n",
+			symbol, entry.FetchedAt.Format("2006-01-02 15:04"), err)
+		return entry.Data, nil
 	}
 
-	// Write to cache (best effort, don't fail on write errors)
-	d.writeCache(path, data)
-
-	return data, nil
+	// Merge and save
+	merged := mergeOHLCV(entry.Data, fresh)
+	d.writeCache(path, merged, period)
+	return merged, nil
 }
 
 // GetQuote delegates to the inner provider (no caching for real-time quotes).
@@ -86,16 +184,23 @@ func (d *DiskCachedProvider) readCache(path string) (*diskCacheEntry, error) {
 	return &entry, nil
 }
 
-func (d *DiskCachedProvider) writeCache(path string, data []OHLCV) {
+func (d *DiskCachedProvider) writeCache(path string, data []OHLCV, origPeriod string) {
 	f, err := os.Create(path)
 	if err != nil {
 		return
 	}
 	defer f.Close()
 
+	lastBar := time.Time{}
+	if len(data) > 0 {
+		lastBar = data[len(data)-1].Date
+	}
+
 	entry := diskCacheEntry{
-		FetchedAt: time.Now(),
-		Data:      data,
+		FetchedAt:   time.Now(),
+		LastBarDate: lastBar,
+		OrigPeriod:  origPeriod,
+		Data:        data,
 	}
 	gob.NewEncoder(f).Encode(entry)
 }

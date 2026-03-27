@@ -102,19 +102,8 @@ func runScan(cmd *cobra.Command, args []string) error {
 		tickers[i] = activeMarket.ApplySuffix(t)
 	}
 
-	// Create provider with disk cache (unless --no-cache)
-	yahoo := marketdata.NewYahooProvider(5)
-	var provider marketdata.Provider = yahoo
-	if !noCache {
-		diskCached := marketdata.NewDiskCachedProvider(yahoo, 24*time.Hour)
-		provider = diskCached
-		if strategy == "all" {
-			// Layer in-memory cache on top for scan-all (avoids re-reading disk per screener)
-			provider = marketdata.NewCachedProviderFrom(diskCached)
-		}
-	} else if strategy == "all" {
-		provider = marketdata.NewCachedProvider(yahoo)
-	}
+	// Create provider with disk cache + circuit breaker (unless --no-cache)
+	provider := marketdata.BuildProvider(noCache)
 
 	logf("🌍 Market: %s (%s)\n", activeMarket.Name, activeMarket.Currency)
 

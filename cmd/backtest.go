@@ -289,12 +289,8 @@ func buildEntriesFromScan(strategy string) ([]backtest.BreakoutEntry, error) {
 		tickers[i] = activeMarket.ApplySuffix(t)
 	}
 
-	// Create provider (with disk cache)
-	yahoo := marketdata.NewYahooProvider(5)
-	var provider marketdata.Provider = yahoo
-	if !noCache {
-		provider = marketdata.NewDiskCachedProvider(yahoo, 24*time.Hour)
-	}
+	// Create provider (with disk cache + circuit breaker)
+	provider := marketdata.BuildProvider(noCache)
 
 	// Get screeners
 	registry := screener.Registry(appConfig)
@@ -302,12 +298,6 @@ func buildEntriesFromScan(strategy string) ([]backtest.BreakoutEntry, error) {
 	if strategy == "all" {
 		for _, s := range registry {
 			screeners = append(screeners, s)
-		}
-		// Layer in-memory cache for scan-all
-		if !noCache {
-			provider = marketdata.NewCachedProviderFrom(provider)
-		} else {
-			provider = marketdata.NewCachedProvider(yahoo)
 		}
 	} else {
 		s, ok := registry[strategy]
