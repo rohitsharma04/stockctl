@@ -26,6 +26,24 @@ stockctl inspect AAPL --output json
 stockctl version --output json
 ```
 
+## ⚠️ Execution Rules
+
+> [!CAUTION]
+> **Never run multiple `stockctl` commands in parallel.** Always wait for one command to complete before starting the next.
+
+Yahoo Finance enforces rate limits, and `stockctl` shares a disk cache across invocations. Running commands concurrently will trigger API throttling, produce incomplete data, and risk cache corruption.
+
+**Command weight classification:**
+
+| Weight | Commands | Expected Duration | Rule |
+|---|---|---|---|
+| **Heavy** | `scan all`, `backtest --strategy`, `pairs` | 2–10 min | Always run alone, wait for full completion |
+| **Medium** | `scan <single-strategy>`, `inspect` | 30s–4 min | Always run alone, wait for full completion |
+| **Light** | `version`, `markets`, `tickers`, `cache` | < 2s | Safe to run individually, but never concurrently with heavy/medium commands |
+
+> [!IMPORTANT]
+> Rate limiting is **per-process**. Launching multiple `stockctl` processes defeats the built-in rate limiter and will cause failures.
+
 ## Configuration
 
 Config at `~/.stockctl/config.toml` (optional — sensible defaults are built in).
@@ -78,6 +96,8 @@ You can still override with `--tickers custom.csv` for a custom universe.
 ### 1. `stockctl scan <strategy>` — Stock Screening
 
 Scans tickers against technical analysis filters. Runs concurrently with scored results.
+
+> **Duration**: `scan all` → 2–5 min | `scan <strategy>` → 1–3 min (500 tickers). Wait for full completion before running another command.
 
 **Strategies:**
 
@@ -150,6 +170,8 @@ stockctl scan all --workers 16 --output json --quiet
 
 Fetches 5 years of daily data and runs all indicators + all 6 screeners with per-filter breakdown.
 
+> **Duration**: 10–30s per ticker. Run one at a time — do not inspect multiple tickers in parallel.
+
 **Usage:**
 ```bash
 stockctl inspect AAPL --output json
@@ -176,6 +198,8 @@ stockctl tickers -m germany             # DAX 40 (table)
 
 Finds correlated stock pairs and simulates mean-reversion trading via z-score signals.
 
+> **Duration**: 30s–2 min depending on number of stocks. Always run alone.
+
 **How it works:**
 1. Downloads 5 years of daily data for all specified stocks
 2. Calculates pairwise Pearson correlation on returns
@@ -201,6 +225,8 @@ stockctl pairs -m india --threshold 0.6 --z-threshold 1.5
 ### 5. `stockctl backtest` — TP/SL Optimization
 
 Grid-searches take-profit and stop-loss combinations for optimal exit parameters.
+
+> **Duration**: 3–10 min. This is the heaviest command — always run alone and wait patiently.
 
 **Two modes:**
 ```bash
@@ -272,15 +298,38 @@ Never overwrites files or pollutes the working directory.
 
 ## Tips for Agents
 
-1. **Always use `--output json --quiet`** for programmatic consumption (structured envelope, no stderr noise)
-2. **Use `-m <market>`** instead of manually appending suffixes
-3. **No `--tickers` needed** — every market has a built-in universe
-4. **`scan all` runs all 6 screeners** — stocks appearing in multiple are stronger signals
-5. **Use `--min-score 0.8`** to surface near-miss stocks that might pass tomorrow
-6. **For Indian stocks**, use `-m india` (NSE) or `-m india-bse` (BSE)
-7. **Rate limiting is built-in** — no need to add delays between calls
-8. **Disk cache (24h)** avoids redundant API calls — use `--no-cache` to force refresh
-9. **`backtest --strategy`** runs scan→backtest in one step, no CSV intermediary needed
-10. **Use `inspect` first** for single-stock deep analysis before running broad scans
-11. **Check `meta.tickers_failed`** in scan output to detect data quality issues
-12. **Use `version --output json`** to discover available strategies and markets
+1. **Run commands ONE AT A TIME.** Never invoke multiple `stockctl` processes simultaneously — this triggers API rate limits and produces incomplete data. Wait for each command to fully complete before starting the next.
+2. **For multi-market analysis**, run each market scan sequentially and aggregate results yourself. Do not parallelize across markets.
+3. **Always use `--output json --quiet`** for programmatic consumption (structured envelope, no stderr noise)
+4. **Use `-m <market>`** instead of manually appending suffixes
+5. **No `--tickers` needed** — every market has a built-in universe
+6. **`scan all` runs all 6 screeners** — stocks appearing in multiple are stronger signals
+7. **Use `--min-score 0.8`** to surface near-miss stocks that might pass tomorrow
+8. **For Indian stocks**, use `-m india` (NSE) or `-m india-bse` (BSE)
+9. **Rate limiting is per-process** — running multiple processes defeats it entirely
+10. **Disk cache (24h)** avoids redundant API calls — use `--no-cache` to force refresh
+11. **`backtest --strategy`** runs scan→backtest in one step, no CSV intermediary needed
+12. **Use `inspect` first** for single-stock deep analysis before running broad scans
+13. **Check `meta.tickers_failed`** in scan output to detect data quality issues
+14. **Use `version --output json`** to discover available strategies and markets
+
+## Example: Multi-Step Workflow (Sequential)
+
+Always run commands one at a time. Wait for each to complete before starting the next.
+
+```bash
+# Step 1 — Scan US market (wait 2-5 min for completion)
+stockctl scan all -m us --output json --quiet > /tmp/us_scan.json
+
+# Step 2 — Only after Step 1 completes, scan India
+stockctl scan all -m india --output json --quiet > /tmp/india_scan.json
+
+# Step 3 — Inspect candidates one at a time (wait 10-30s each)
+stockctl inspect AAPL --output json > /tmp/aapl.json
+
+# Step 4 — Only after Step 3 completes
+stockctl inspect RELIANCE -m india --output json > /tmp/reliance.json
+
+# Step 5 — Backtest (wait 3-10 min)
+stockctl backtest --strategy breakout-caution -m us --output json > /tmp/backtest.json
+```
