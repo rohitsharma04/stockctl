@@ -16,17 +16,23 @@ stockctl scan all --output json --quiet
 # Scan Indian stocks
 stockctl scan breakout-caution -m india --output json --quiet
 
+# Preview a scan without fetching data (dry-run)
+stockctl scan all --dry-run --output json --quiet
+
 # Include near-miss stocks (score ≥ 80%)
 stockctl scan all --min-score 0.8 --output json --quiet
 
 # Scan as of a past date (historical analysis)
 stockctl scan breakout-caution --date 2026-02-03 --output json --quiet
 
+# Scan with per-filter breakdown in results
+stockctl scan breakout-caution --detail --output json --quiet
+
 # Deep-analyze a single stock
 stockctl inspect AAPL --output json
 
-# Inspect as of a past date
-stockctl inspect AAPL --date 2026-02-03 --output json
+# Quick price check
+stockctl quote AAPL MSFT GOOGL --output json
 
 # Version & capabilities
 stockctl version --output json
@@ -45,7 +51,7 @@ Yahoo Finance enforces rate limits, and `stockctl` shares a disk cache across in
 |---|---|---|---|
 | **Heavy** | `scan all`, `backtest --strategy`, `pairs` | 2–10 min | Always run alone, wait for full completion |
 | **Medium** | `scan <single-strategy>`, `inspect` | 30s–4 min | Always run alone, wait for full completion |
-| **Light** | `version`, `markets`, `tickers`, `cache` | < 2s | Safe to run individually, but never concurrently with heavy/medium commands |
+| **Light** | `version`, `markets`, `tickers`, `cache`, `quote`, `scan --dry-run` | < 2s | Safe to run individually, but never concurrently with heavy/medium commands |
 
 > [!IMPORTANT]
 > Rate limiting is **per-process**. Launching multiple `stockctl` processes defeats the built-in rate limiter and will cause failures.
@@ -122,24 +128,26 @@ Scans tickers against technical analysis filters. Runs concurrently with scored 
 # Zero-config — scans built-in S&P 500
 stockctl scan breakout-caution --output json --quiet
 
+# Dry-run — preview scan plan without fetching data
+stockctl scan all --dry-run --output json --quiet
+
 # Scan Indian NSE — built-in Nifty 500
 stockctl scan all -m india --output json --quiet
 
 # Historical analysis — run screener as if it were Feb 3rd
 stockctl scan breakout-caution --date 2026-02-03 --output json --quiet
-stockctl scan all -m india --date 2025-12-15 --output json --quiet
 
 # Include near-miss stocks (score ≥ 80%)
 stockctl scan rsi-bounce --min-score 0.8 --output json --quiet
 
-# Scan Japanese market
-stockctl scan high-performance -m japan --output json
+# Include per-filter detail (avoids follow-up inspect calls)
+stockctl scan breakout-caution --detail --output json --quiet
 
-# Custom ticker file
-stockctl scan stellar-breakout --tickers custom.csv --output json
+# Sort by ticker (default: score descending)
+stockctl scan all --sort ticker --output json --quiet
 
-# Increase concurrency
-stockctl scan all --workers 16 --output json --quiet
+# Set a timeout
+stockctl scan all --timeout 3m --output json --quiet
 ```
 
 **Flags:**
@@ -152,6 +160,9 @@ stockctl scan all --workers 16 --output json --quiet
 | `--output / -o` | `table` | `table`, `json`, `csv` |
 | `--min-score` | `1.0` | Minimum score to include (0.0–1.0). Use `0.8` for near-misses |
 | `--min-price` | from market | Minimum stock price filter |
+| `--sort` | `score` | Sort results by: `score`, `ticker`, `filters` |
+| `--detail` | `false` | Include per-filter breakdown in results |
+| `--dry-run` | `false` | Show scan plan without fetching data (instant) |
 | `--quiet / -q` | `false` | Suppress all progress output (agent mode) |
 | `--no-cache` | `false` | Bypass disk cache |
 | `--verbose / -v` | `false` | Show per-ticker errors |
@@ -160,6 +171,7 @@ stockctl scan all --workers 16 --output json --quiet
 ```json
 {
   "meta": {
+    "schema_version": "1.0",
     "command": "scan",
     "market": "us",
     "strategy": "breakout-caution",
@@ -170,7 +182,11 @@ stockctl scan all --workers 16 --output json --quiet
     "timestamp": "2026-03-26T17:00:00Z"
   },
   "results": [
-    {"ticker": "AAPL", "strategy": "breakout-caution", "score": 1.0, "filters_passed": 6, "total_filters": 6}
+    {
+      "ticker": "AAPL", "strategy": "breakout-caution", "score": 1.0,
+      "filters_passed": 6, "total_filters": 6,
+      "close_price": 198.50, "volume": 52340000, "change_pct": 0.012
+    }
   ],
   "errors": [
     {"ticker": "XYZ", "error": "no data returned"}
@@ -178,6 +194,8 @@ stockctl scan all --workers 16 --output json --quiet
 }
 ```
 
+> Results now include `close_price`, `volume`, and `change_pct` — no need to run `inspect` just for price info.
+> When `--detail` is used, each result also includes a `filters` array with per-filter pass/fail and values.
 > `as_of_date` is only present when `--date` is used. If omitted, the analysis ran on the latest available data.
 
 ### 2. `stockctl inspect <ticker>` — Single Stock Deep Analysis
@@ -201,6 +219,7 @@ stockctl inspect RELIANCE -m india --date 2025-12-15 --output json
 - **Price**: close, open, high, low, volume, 52-week high/low
 - **Indicators**: SMA(50), SMA(200), Bollinger Bands, ATR(14), Heikin-Ashi, Momentum
 - **Screeners**: All 6 strategies with pass/fail, score, and per-filter detail
+- **Errored screeners** are included with `"pass": null, "score": null, "error": "..."` instead of being silently omitted
 
 ### 3. `stockctl tickers` — List Built-in Universes
 
@@ -239,6 +258,7 @@ stockctl pairs -m india --threshold 0.6 --z-threshold 1.5
 | `--z-threshold` | `2.0` | Z-score entry threshold |
 | `--window` | `50` | Rolling window for z-score |
 | `--capital` | `100000` | Capital per pair |
+| `--export-signals` | `false` | Export trade signals as CSV to `/tmp/stockctl/run_*/` |
 
 ### 5. `stockctl backtest` — TP/SL Optimization
 
@@ -285,6 +305,17 @@ stockctl version --output json
 
 Returns version, Go version, available strategies, markets, and total ticker count.
 
+### 9. `stockctl quote <tickers...>` — Real-Time Quotes
+
+Fetch current price and volume for one or more tickers.
+
+```bash
+stockctl quote AAPL MSFT GOOGL --output json
+stockctl quote RELIANCE TCS -m india --output json
+```
+
+Bridges the gap between scanning (historical) and execution decisions (current price).
+
 ## Global Flags
 
 | Flag | Short | Default | Description |
@@ -295,17 +326,26 @@ Returns version, Go version, available strategies, markets, and total ticker cou
 | `--quiet` | `-q` | `false` | Suppress stderr (agent mode) |
 | `--no-cache` | | `false` | Bypass disk cache |
 | `--verbose` | `-v` | `false` | Show detailed errors |
+| `--timeout` | | (none) | Command timeout (e.g., `5m`, `30s`) |
+| `--progress` | | `text` | Progress mode: `text`, `json`, `none` (auto `none` with `--quiet`) |
 
 ## Output Format
 
-All commands support `--output json` and return a **standard envelope**:
+All commands support `--output json` and return a **standard envelope** with schema versioning:
 
 ```json
 {
-  "meta": {"command": "...", "market": "...", "duration_ms": 123, "timestamp": "..."},
+  "meta": {"schema_version": "1.0", "command": "...", "market": "...", "duration_ms": 123, "timestamp": "..."},
   "results": ...,
   "errors": [...]
 }
+```
+
+**Error handling**: Fatal errors (bad market, missing args) also emit the JSON envelope when `--output json` is set, so agents don't need to parse stderr separately.
+
+**Structured progress** (`--progress json`): When enabled, emits NDJSON progress events to stderr:
+```jsonl
+{"type":"progress","current":250,"total":503,"elapsed_ms":45000}
 ```
 
 CSV/table exports are written to a **unique per-run temp directory**:
@@ -319,35 +359,45 @@ Never overwrites files or pollutes the working directory.
 1. **Run commands ONE AT A TIME.** Never invoke multiple `stockctl` processes simultaneously — this triggers API rate limits and produces incomplete data. Wait for each command to fully complete before starting the next.
 2. **For multi-market analysis**, run each market scan sequentially and aggregate results yourself. Do not parallelize across markets.
 3. **Always use `--output json --quiet`** for programmatic consumption (structured envelope, no stderr noise)
-4. **Use `--date YYYY-MM-DD`** for historical analysis — run any scan or inspect as if it were a past date
-5. **Use `-m <market>`** instead of manually appending suffixes
-6. **No `--tickers` needed** — every market has a built-in universe
-7. **`scan all` runs all 6 screeners** — stocks appearing in multiple are stronger signals
-8. **Use `--min-score 0.8`** to surface near-miss stocks that might pass tomorrow
-9. **For Indian stocks**, use `-m india` (NSE) or `-m india-bse` (BSE)
-10. **Rate limiting is per-process** — running multiple processes defeats it entirely
-11. **Disk cache (24h)** avoids redundant API calls — use `--no-cache` to force refresh
-12. **`backtest --strategy`** runs scan→backtest in one step, no CSV intermediary needed
-13. **Use `inspect` first** for single-stock deep analysis before running broad scans
-14. **Check `meta.tickers_failed`** in scan output to detect data quality issues
-15. **Use `version --output json`** to discover available strategies and markets
+4. **Use `--dry-run`** to preview a scan plan (ticker count, strategies, estimated duration) before committing
+5. **Use `--detail`** on scan to get per-filter breakdowns — avoids follow-up `inspect` calls for triage
+6. **Scan results include `close_price`, `volume`, `change_pct`** — no need to call `inspect` just for price info
+7. **Use `--timeout 5m`** to prevent stuck commands from blocking your pipeline
+8. **Use `--progress json`** (with or without `--quiet`) to get structured progress events on stderr
+9. **Use `--date YYYY-MM-DD`** for historical analysis — run any scan or inspect as if it were a past date
+10. **Use `-m <market>`** instead of manually appending suffixes
+11. **No `--tickers` needed** — every market has a built-in universe
+12. **`scan all` runs all 6 screeners** — stocks appearing in multiple are stronger signals
+13. **Use `--min-score 0.8`** to surface near-miss stocks that might pass tomorrow
+14. **For Indian stocks**, use `-m india` (NSE) or `-m india-bse` (BSE)
+15. **Rate limiting is per-process** — running multiple processes defeats it entirely
+16. **Disk cache (24h)** avoids redundant API calls — use `--no-cache` to force refresh
+17. **`backtest --strategy`** runs scan→backtest in one step, no CSV intermediary needed
+18. **Check `meta.tickers_failed`** in scan output to detect data quality issues
+19. **Check `meta.schema_version`** to detect output format changes
+20. **Use `version --output json`** to discover available strategies and markets
+21. **Use `quote`** for current prices after scanning — bridges historical analysis to live data
+22. **Fatal errors emit JSON** when `--output json` is set — no need to parse stderr for errors
 
 ## Example: Multi-Step Workflow (Sequential)
 
 Always run commands one at a time. Wait for each to complete before starting the next.
 
 ```bash
-# Step 1 — Scan US market (wait 2-5 min for completion)
-stockctl scan all -m us --output json --quiet > /tmp/us_scan.json
+# Step 0 — Preview the scan plan (instant, no API calls)
+stockctl scan all --dry-run -m us --output json --quiet
+
+# Step 1 — Scan US market with timeout (wait 2-5 min for completion)
+stockctl scan all -m us --timeout 5m --output json --quiet > /tmp/us_scan.json
 
 # Step 2 — Only after Step 1 completes, scan India
-stockctl scan all -m india --output json --quiet > /tmp/india_scan.json
+stockctl scan all -m india --timeout 5m --output json --quiet > /tmp/india_scan.json
 
-# Step 3 — Inspect candidates one at a time (wait 10-30s each)
+# Step 3 — Quick price check on candidates (instant)
+stockctl quote AAPL MSFT -m us --output json
+
+# Step 4 — Inspect top candidates one at a time (wait 10-30s each)
 stockctl inspect AAPL --output json > /tmp/aapl.json
-
-# Step 4 — Only after Step 3 completes
-stockctl inspect RELIANCE -m india --output json > /tmp/reliance.json
 
 # Step 5 — Backtest (wait 3-10 min)
 stockctl backtest --strategy breakout-caution -m us --output json > /tmp/backtest.json

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 	"os"
@@ -20,9 +21,12 @@ var (
 	verbose      bool
 	quiet        bool
 	noCache      bool
+	timeoutStr   string
+	progressMode string
 	appConfig    *config.Config
 	activeMarket marketdata.Market
-	runDir       string // unique per-run output directory
+	runDir       string         // unique per-run output directory
+	rootCtx      context.Context // root context, supports --timeout
 )
 
 // createRunDir creates a unique output directory under /tmp/stockctl/
@@ -46,19 +50,57 @@ func logf(format string, a ...interface{}) {
 	}
 }
 
+// reportProgress emits a structured progress event.
+// In "json" mode, emits NDJSON to stderr. In "text" mode, emits human-readable text.
+// In "none" mode (or when --quiet is set), does nothing.
+func reportProgress(current, total int, elapsedMs int64) {
+	effectiveMode := progressMode
+	if quiet && effectiveMode == "" {
+		effectiveMode = "none"
+	}
+	if effectiveMode == "" {
+		effectiveMode = "text"
+	}
+
+	switch effectiveMode {
+	case "json":
+		fmt.Fprintf(os.Stderr, `{"type":"progress","current":%d,"total":%d,"elapsed_ms":%d}`+"\n", current, total, elapsedMs)
+	case "text":
+		if !quiet {
+			fmt.Fprintf(os.Stderr, "  \U0001F4C8 Progress: %d/%d\n", current, total)
+		}
+	case "none":
+		// silent
+	}
+}
+
 var rootCmd = &cobra.Command{
 	Use:   "stockctl",
 	Short: "Stock analysis CLI — screeners, pairs trading, and backtesting",
 	Long: `stockctl is a command-line tool for stock analysis.
 
 It provides:
-  • Stock screeners (breakout-caution, high-performance, stellar-breakout, descending-breakout)
+  • Stock screeners (breakout-caution, high-performance, stellar-breakout,
+    descending-breakout, rsi-bounce, macd-crossover)
   • Pairs trading simulation (correlative hedging with z-score signals)
   • Backtesting engine (TP/SL optimization with Sharpe ratio analysis)
+  • Real-time quotes for quick price checks
 
 Configuration: ~/.stockctl/config.toml (override: STOCKCTL_CONFIG env var or --config)
 Output files:  /tmp/stockctl/run_<timestamp>_<id>/ (unique per run, never overwrites)`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		// Initialize root context (always, even for skipped commands)
+		rootCtx = context.Background()
+		if timeoutStr != "" {
+			dur, err := time.ParseDuration(timeoutStr)
+			if err != nil {
+				return fmt.Errorf("invalid --timeout %q: %w", timeoutStr, err)
+			}
+			var cancel context.CancelFunc
+			rootCtx, cancel = context.WithTimeout(rootCtx, dur)
+			_ = cancel // cleaned up on process exit
+		}
+
 		// Skip config loading for the markets command
 		if cmd.Name() == "markets" || cmd.Name() == "version" || cmd.Name() == "stats" || cmd.Name() == "clear" {
 			return nil
@@ -96,7 +138,16 @@ Output files:  /tmp/stockctl/run_<timestamp>_<id>/ (unique per run, never overwr
 }
 
 func Execute() {
-	if err := rootCmd.Execute(); err != nil {
+	err := rootCmd.Execute()
+	if err != nil {
+		// When JSON output was requested, emit structured error envelope on stdout
+		if outputFmt == "json" {
+			env := output.Envelope{
+				Meta:   output.NewMeta("error"),
+				Errors: []output.ErrorInfo{{Error: err.Error()}},
+			}
+			output.WriteEnvelope(os.Stdout, env)
+		}
 		os.Exit(1)
 	}
 }
@@ -156,6 +207,8 @@ func init() {
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "verbose output")
 	rootCmd.PersistentFlags().BoolVarP(&quiet, "quiet", "q", false, "suppress all progress output (agent mode)")
 	rootCmd.PersistentFlags().BoolVar(&noCache, "no-cache", false, "bypass disk cache")
+	rootCmd.PersistentFlags().StringVar(&timeoutStr, "timeout", "", "command timeout (e.g., 5m, 30s)")
+	rootCmd.PersistentFlags().StringVar(&progressMode, "progress", "", "progress output mode: text, json, none (default: text, or none with --quiet)")
 	rootCmd.AddCommand(marketsCmd)
 }
 

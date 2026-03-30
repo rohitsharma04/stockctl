@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,9 @@ var (
 	workers     int
 	months      int
 	minScore    float64
+	sortBy      string
+	scanDetail  bool
+	scanDryRun  bool
 )
 
 var scanCmd = &cobra.Command{
@@ -57,12 +61,15 @@ func init() {
 	scanCmd.Flags().IntVar(&workers, "workers", 0, "number of concurrent workers (default from config)")
 	scanCmd.Flags().IntVar(&months, "months", 0, "months for descending-breakout (default from config)")
 	scanCmd.Flags().Float64Var(&minScore, "min-score", 1.0, "minimum score to include (0.0-1.0, default 1.0 = only full passes)")
+	scanCmd.Flags().StringVar(&sortBy, "sort", "score", "sort results by: score, ticker, filters")
+	scanCmd.Flags().BoolVar(&scanDetail, "detail", false, "include per-filter breakdown in results")
+	scanCmd.Flags().BoolVar(&scanDryRun, "dry-run", false, "show scan plan without fetching data")
 	rootCmd.AddCommand(scanCmd)
 }
 
 func runScan(cmd *cobra.Command, args []string) error {
 	strategy := args[0]
-	ctx := context.Background()
+	ctx := rootCtx
 	startTime := time.Now()
 
 	// Parse --date for historical analysis
@@ -135,6 +142,54 @@ func runScan(cmd *cobra.Command, args []string) error {
 		screeners = append(screeners, s)
 	}
 
+	// Dry-run mode: output plan and exit
+	if scanDryRun {
+		type scanPlan struct {
+			Market          string   `json:"market"`
+			Tickers         int      `json:"tickers"`
+			Strategy        string   `json:"strategy"`
+			StrategiesCount int      `json:"strategies_count"`
+			StrategyNames   []string `json:"strategy_names"`
+			Workers         int      `json:"workers"`
+			EstDurationSec  int      `json:"estimated_duration_s"`
+		}
+		names := make([]string, len(screeners))
+		for i, s := range screeners {
+			names[i] = s.Name()
+		}
+		// Rough estimate: ~0.5s per ticker per strategy with cache
+		estSec := len(tickers) * len(screeners) / w
+		if estSec < 5 {
+			estSec = 5
+		}
+		plan := scanPlan{
+			Market:          activeMarket.ID,
+			Tickers:         len(tickers),
+			Strategy:        strategy,
+			StrategiesCount: len(screeners),
+			StrategyNames:   names,
+			Workers:         w,
+			EstDurationSec:  estSec,
+		}
+		if appConfig.General.Output == "json" {
+			meta := output.NewMeta("scan-plan")
+			meta.Market = activeMarket.ID
+			meta.Strategy = strategy
+			env := output.Envelope{
+				Meta:    meta,
+				Results: plan,
+			}
+			return output.WriteEnvelope(os.Stdout, env)
+		}
+		logf("📋 Dry-run plan:\n")
+		logf("   Market:     %s (%s)\n", activeMarket.Name, activeMarket.ID)
+		logf("   Tickers:    %d\n", len(tickers))
+		logf("   Strategy:   %s (%d screeners)\n", strategy, len(screeners))
+		logf("   Workers:    %d\n", w)
+		logf("   Est. time:  ~%ds\n", estSec)
+		return nil
+	}
+
 	// Fetch benchmark data for screeners that need it
 	logf("📊 Fetching benchmark data (%s)...\n", activeMarket.Benchmark)
 	benchmarkData, err := provider.GetHistory(ctx, activeMarket.Benchmark, "5y", "1d")
@@ -177,6 +232,24 @@ func runScan(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Sort results deterministically
+	sort.Slice(allResults, func(i, j int) bool {
+		switch sortBy {
+		case "ticker":
+			return allResults[i].Ticker < allResults[j].Ticker
+		case "filters":
+			if allResults[i].FiltersPassed != allResults[j].FiltersPassed {
+				return allResults[i].FiltersPassed > allResults[j].FiltersPassed
+			}
+			return allResults[i].Ticker < allResults[j].Ticker
+		default: // "score"
+			if allResults[i].Score != allResults[j].Score {
+				return allResults[i].Score > allResults[j].Score
+			}
+			return allResults[i].Ticker < allResults[j].Ticker
+		}
+	})
+
 	// JSON output with envelope
 	if appConfig.General.Output == "json" {
 		meta := output.NewMeta("scan")
@@ -200,16 +273,21 @@ func runScan(cmd *cobra.Command, args []string) error {
 }
 
 type scanResult struct {
-	Ticker        string  `json:"ticker"`
-	Strategy      string  `json:"strategy"`
-	Score         float64 `json:"score"`
-	FiltersPassed int     `json:"filters_passed"`
-	TotalFilters  int     `json:"total_filters"`
+	Ticker        string                  `json:"ticker"`
+	Strategy      string                  `json:"strategy"`
+	Score         float64                 `json:"score"`
+	FiltersPassed int                     `json:"filters_passed"`
+	TotalFilters  int                     `json:"total_filters"`
+	ClosePrice    float64                 `json:"close_price,omitempty"`
+	Volume        float64                 `json:"volume,omitempty"`
+	ChangePct     float64                 `json:"change_pct,omitempty"`
+	Filters       []screener.FilterResult `json:"filters,omitempty"`
 }
 
 func runScreener(ctx context.Context, scr screener.Screener, tickers []string,
 	provider marketdata.Provider, benchmark []marketdata.OHLCV, workers int, asOfDate time.Time) ([]scanResult, []output.ErrorInfo) {
 
+	screenerStart := time.Now()
 	type job struct {
 		ticker string
 	}
@@ -273,20 +351,37 @@ func runScreener(ctx context.Context, scr screener.Screener, tickers []string,
 							passed++
 						}
 					}
-					mu.Lock()
-					results = append(results, scanResult{
+
+					// Extract price data from already-fetched data
+					dn := len(data)
+					closePrice := data[dn-1].Close
+					volume := data[dn-1].Volume
+					changePct := 0.0
+					if dn >= 2 && data[dn-2].Close > 0 {
+						changePct = (data[dn-1].Close - data[dn-2].Close) / data[dn-2].Close
+					}
+
+					sr := scanResult{
 						Ticker:        j.ticker,
 						Strategy:      scr.Name(),
 						Score:         result.Score,
 						FiltersPassed: passed,
 						TotalFilters:  len(result.Filters),
-					})
+						ClosePrice:    closePrice,
+						Volume:        volume,
+						ChangePct:     changePct,
+					}
+					if scanDetail {
+						sr.Filters = result.Filters
+					}
+					mu.Lock()
+					results = append(results, sr)
 					mu.Unlock()
 				}
 
 				count := atomic.AddInt64(&processed, 1)
 				if count%50 == 0 || count == total {
-					logf("  📈 Progress: %d/%d\n", count, total)
+					reportProgress(int(count), int(total), time.Since(screenerStart).Milliseconds())
 				}
 			}
 		}()

@@ -15,6 +15,7 @@ type Envelope struct {
 
 // Meta holds metadata about the command execution.
 type Meta struct {
+	SchemaVersion  string `json:"schema_version"`
 	Command        string `json:"command"`
 	Market         string `json:"market,omitempty"`
 	Strategy       string `json:"strategy,omitempty"`
@@ -34,8 +35,9 @@ type ErrorInfo struct {
 // NewMeta creates a Meta with the current timestamp.
 func NewMeta(command string) Meta {
 	return Meta{
-		Command:   command,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		SchemaVersion: "1.0",
+		Command:       command,
+		Timestamp:     time.Now().UTC().Format(time.RFC3339),
 	}
 }
 

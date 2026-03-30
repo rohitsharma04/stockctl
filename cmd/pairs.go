@@ -1,9 +1,10 @@
 package cmd
 
 import (
-	"context"
+	"encoding/csv"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -15,11 +16,12 @@ import (
 )
 
 var (
-	pairsStocks    string
-	pairsThreshold float64
-	pairsCapital   float64
-	pairsWindow    int
-	pairsZThresh   float64
+	pairsStocks       string
+	pairsThreshold    float64
+	pairsCapital      float64
+	pairsWindow       int
+	pairsZThresh      float64
+	pairsExportSignals bool
 )
 
 var pairsCmd = &cobra.Command{
@@ -43,11 +45,12 @@ func init() {
 	pairsCmd.Flags().Float64Var(&pairsCapital, "capital", 0, "initial capital per pair (default from config)")
 	pairsCmd.Flags().IntVar(&pairsWindow, "window", 0, "rolling window for z-score (default from config)")
 	pairsCmd.Flags().Float64Var(&pairsZThresh, "z-threshold", 0, "z-score entry threshold (default from config)")
+	pairsCmd.Flags().BoolVar(&pairsExportSignals, "export-signals", false, "export trade signals as backtest-compatible CSV")
 	rootCmd.AddCommand(pairsCmd)
 }
 
 func runPairs(cmd *cobra.Command, args []string) error {
-	ctx := context.Background()
+	ctx := rootCtx
 	startTime := time.Now()
 	cfg := appConfig.Pairs
 
@@ -78,7 +81,7 @@ func runPairs(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(stocks) < 2 {
-		return fmt.Errorf("need at least 2 stocks for pairs trading")
+		return fmt.Errorf("need at least 2 stocks for pairs trading\nUse --stocks \"AAPL,MSFT,GOOGL\" or set stocks in [pairs] config")
 	}
 
 	// Apply market suffix
@@ -187,6 +190,13 @@ func runPairs(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Export signals if requested
+	if pairsExportSignals {
+		if err := exportPairsSignals(results); err != nil {
+			return err
+		}
+	}
+
 	// Output
 	switch output.Format(appConfig.General.Output) {
 	case output.FormatJSON:
@@ -218,5 +228,46 @@ func runPairs(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	return nil
+}
+
+// exportPairsSignals writes trade signals from pairs simulation as a
+// backtest-compatible CSV file that can be fed to `stockctl backtest --input`.
+func exportPairsSignals(results []pairs.SimulationResult) error {
+	if len(results) == 0 {
+		logf("No trades to export.\n")
+		return nil
+	}
+
+	filename := filepath.Join(runDir, fmt.Sprintf("pairs_signals_%s.csv", time.Now().Format("2006-01-02_150405")))
+	f, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("creating signals CSV: %w", err)
+	}
+	defer f.Close()
+
+	w := csv.NewWriter(f)
+	w.Write([]string{"Symbol", "Entry_Date", "Exit_Date", "Long_Stock", "Short_Stock", "PnL", "Position"})
+
+	for _, r := range results {
+		pairName := fmt.Sprintf("%s/%s", r.Stock1, r.Stock2)
+		for _, t := range r.Trades {
+			dir := "long_spread"
+			if t.Position == -1 {
+				dir = "short_spread"
+			}
+			w.Write([]string{
+				pairName,
+				t.EntryDate.Format("2006-01-02"),
+				t.ExitDate.Format("2006-01-02"),
+				t.LongStock,
+				t.ShortStock,
+				fmt.Sprintf("%.2f", t.Profit),
+				dir,
+			})
+		}
+	}
+	w.Flush()
+	logf("📁 Signals exported to %s\n", filename)
 	return nil
 }

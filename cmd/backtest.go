@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"encoding/csv"
 	"fmt"
 	"os"
@@ -136,6 +135,9 @@ func runBacktest(cmd *cobra.Command, args []string) error {
 		}
 		meta := output.NewMeta("backtest")
 		meta.Market = activeMarket.ID
+		if btStrategy != "" {
+			meta.Strategy = btStrategy
+		}
 		meta.DurationMs = time.Since(startTime).Milliseconds()
 		env := output.Envelope{
 			Meta:    meta,
@@ -276,7 +278,7 @@ func parseFloatList(s string) []float64 {
 // buildEntriesFromScan runs a scan with the given strategy and builds
 // BreakoutEntry objects from the results.
 func buildEntriesFromScan(strategy string) ([]backtest.BreakoutEntry, error) {
-	ctx := context.Background()
+	ctx := rootCtx
 
 	// Load tickers
 	rawTickers, err := marketdata.GetUniverse(appConfig.General.Market)

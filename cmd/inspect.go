@@ -1,8 +1,6 @@
 package cmd
 
 import (
-	"context"
-	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -64,14 +62,15 @@ type indicatorValues struct {
 
 type screenerInspection struct {
 	Name    string                  `json:"name"`
-	Pass    bool                    `json:"pass"`
-	Score   float64                 `json:"score"`
-	Filters []screener.FilterResult `json:"filters"`
+	Pass    *bool                   `json:"pass"`
+	Score   *float64                `json:"score"`
+	Filters []screener.FilterResult `json:"filters,omitempty"`
+	Error   string                  `json:"error,omitempty"`
 }
 
 func runInspect(cmd *cobra.Command, args []string) error {
 	ticker := args[0]
-	ctx := context.Background()
+	ctx := rootCtx
 	startTime := time.Now()
 
 	// Parse --date for historical analysis
@@ -172,12 +171,18 @@ func runInspect(cmd *cobra.Command, args []string) error {
 	for _, scr := range allScreeners {
 		sr, err := scr.Screen(ctx, data, benchmark)
 		if err != nil {
+			result.Screeners = append(result.Screeners, screenerInspection{
+				Name:  scr.Name(),
+				Error: err.Error(),
+			})
 			continue
 		}
+		pass := sr.Pass
+		score := sr.Score
 		result.Screeners = append(result.Screeners, screenerInspection{
 			Name:    scr.Name(),
-			Pass:    sr.Pass,
-			Score:   sr.Score,
+			Pass:    &pass,
+			Score:   &score,
 			Filters: sr.Filters,
 		})
 	}
@@ -223,11 +228,19 @@ func runInspect(cmd *cobra.Command, args []string) error {
 		fmt.Printf("\n🔍 Screener Results\n")
 		fmt.Printf("─────────────────────────────\n")
 		for _, si := range result.Screeners {
+			if si.Error != "" {
+				fmt.Printf("  ⚠️  %s — Error: %s\n", si.Name, si.Error)
+				continue
+			}
 			passStr := "❌"
-			if si.Pass {
+			if si.Pass != nil && *si.Pass {
 				passStr = "✅"
 			}
-			fmt.Printf("  %s %s — Score: %.0f%%\n", passStr, si.Name, si.Score*100)
+			scoreVal := 0.0
+			if si.Score != nil {
+				scoreVal = *si.Score
+			}
+			fmt.Printf("  %s %s — Score: %.0f%%\n", passStr, si.Name, scoreVal*100)
 			for _, f := range si.Filters {
 				fPass := "✗"
 				if f.Pass {
@@ -253,6 +266,4 @@ func safeFloat(v float64) float64 {
 	return v
 }
 
-// keep json import used
-var _ = json.Marshal
 
