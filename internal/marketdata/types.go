@@ -1,6 +1,9 @@
 package marketdata
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // OHLCV represents a single candlestick bar.
 type OHLCV struct {
@@ -184,4 +187,25 @@ func Volumes(data []OHLCV) []float64 {
 		out[i] = d.Volume
 	}
 	return out
+}
+
+// TruncateAt returns data up to and including the given date.
+// If date is zero, returns data as-is (no truncation).
+// Returns an error if truncation would leave no data.
+func TruncateAt(data []OHLCV, date time.Time) ([]OHLCV, error) {
+	if date.IsZero() {
+		return data, nil
+	}
+	// Find the last bar on or before the given date.
+	idx := -1
+	for i := len(data) - 1; i >= 0; i-- {
+		if !data[i].Date.After(date) {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return nil, fmt.Errorf("no data on or before %s", date.Format("2006-01-02"))
+	}
+	return data[:idx+1], nil
 }

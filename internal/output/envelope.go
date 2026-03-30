@@ -15,13 +15,14 @@ type Envelope struct {
 
 // Meta holds metadata about the command execution.
 type Meta struct {
-	Command        string  `json:"command"`
-	Market         string  `json:"market,omitempty"`
-	Strategy       string  `json:"strategy,omitempty"`
-	TickersScanned int     `json:"tickers_scanned,omitempty"`
-	TickersFailed  int     `json:"tickers_failed,omitempty"`
-	DurationMs     int64   `json:"duration_ms"`
-	Timestamp      string  `json:"timestamp"`
+	Command        string `json:"command"`
+	Market         string `json:"market,omitempty"`
+	Strategy       string `json:"strategy,omitempty"`
+	AsOfDate       string `json:"as_of_date,omitempty"`
+	TickersScanned int    `json:"tickers_scanned,omitempty"`
+	TickersFailed  int    `json:"tickers_failed,omitempty"`
+	DurationMs     int64  `json:"duration_ms"`
+	Timestamp      string `json:"timestamp"`
 }
 
 // ErrorInfo represents a per-ticker or per-operation error.

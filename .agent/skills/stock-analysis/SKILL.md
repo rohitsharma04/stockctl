@@ -19,8 +19,14 @@ stockctl scan breakout-caution -m india --output json --quiet
 # Include near-miss stocks (score ≥ 80%)
 stockctl scan all --min-score 0.8 --output json --quiet
 
+# Scan as of a past date (historical analysis)
+stockctl scan breakout-caution --date 2026-02-03 --output json --quiet
+
 # Deep-analyze a single stock
 stockctl inspect AAPL --output json
+
+# Inspect as of a past date
+stockctl inspect AAPL --date 2026-02-03 --output json
 
 # Version & capabilities
 stockctl version --output json
@@ -119,6 +125,10 @@ stockctl scan breakout-caution --output json --quiet
 # Scan Indian NSE — built-in Nifty 500
 stockctl scan all -m india --output json --quiet
 
+# Historical analysis — run screener as if it were Feb 3rd
+stockctl scan breakout-caution --date 2026-02-03 --output json --quiet
+stockctl scan all -m india --date 2025-12-15 --output json --quiet
+
 # Include near-miss stocks (score ≥ 80%)
 stockctl scan rsi-bounce --min-score 0.8 --output json --quiet
 
@@ -135,6 +145,7 @@ stockctl scan all --workers 16 --output json --quiet
 **Flags:**
 | Flag | Default | Description |
 |---|---|---|
+| `--date` | (today) | Evaluate as of a past date (`YYYY-MM-DD`). Data is truncated to this date |
 | `--tickers <path>` | (built-in universe) | CSV with `Symbol` column or one symbol per line |
 | `--market / -m` | `us` | Target market |
 | `--workers` | `8` | Concurrent workers |
@@ -152,6 +163,7 @@ stockctl scan all --workers 16 --output json --quiet
     "command": "scan",
     "market": "us",
     "strategy": "breakout-caution",
+    "as_of_date": "2026-02-03",
     "tickers_scanned": 503,
     "tickers_failed": 5,
     "duration_ms": 45000,
@@ -166,6 +178,8 @@ stockctl scan all --workers 16 --output json --quiet
 }
 ```
 
+> `as_of_date` is only present when `--date` is used. If omitted, the analysis ran on the latest available data.
+
 ### 2. `stockctl inspect <ticker>` — Single Stock Deep Analysis
 
 Fetches 5 years of daily data and runs all indicators + all 6 screeners with per-filter breakdown.
@@ -177,6 +191,10 @@ Fetches 5 years of daily data and runs all indicators + all 6 screeners with per
 stockctl inspect AAPL --output json
 stockctl inspect RELIANCE -m india --output json
 stockctl inspect 7203 -m japan --output json
+
+# Historical inspection — see indicators/screeners as of a past date
+stockctl inspect AAPL --date 2026-02-03 --output json
+stockctl inspect RELIANCE -m india --date 2025-12-15 --output json
 ```
 
 **Output includes:**
@@ -301,17 +319,18 @@ Never overwrites files or pollutes the working directory.
 1. **Run commands ONE AT A TIME.** Never invoke multiple `stockctl` processes simultaneously — this triggers API rate limits and produces incomplete data. Wait for each command to fully complete before starting the next.
 2. **For multi-market analysis**, run each market scan sequentially and aggregate results yourself. Do not parallelize across markets.
 3. **Always use `--output json --quiet`** for programmatic consumption (structured envelope, no stderr noise)
-4. **Use `-m <market>`** instead of manually appending suffixes
-5. **No `--tickers` needed** — every market has a built-in universe
-6. **`scan all` runs all 6 screeners** — stocks appearing in multiple are stronger signals
-7. **Use `--min-score 0.8`** to surface near-miss stocks that might pass tomorrow
-8. **For Indian stocks**, use `-m india` (NSE) or `-m india-bse` (BSE)
-9. **Rate limiting is per-process** — running multiple processes defeats it entirely
-10. **Disk cache (24h)** avoids redundant API calls — use `--no-cache` to force refresh
-11. **`backtest --strategy`** runs scan→backtest in one step, no CSV intermediary needed
-12. **Use `inspect` first** for single-stock deep analysis before running broad scans
-13. **Check `meta.tickers_failed`** in scan output to detect data quality issues
-14. **Use `version --output json`** to discover available strategies and markets
+4. **Use `--date YYYY-MM-DD`** for historical analysis — run any scan or inspect as if it were a past date
+5. **Use `-m <market>`** instead of manually appending suffixes
+6. **No `--tickers` needed** — every market has a built-in universe
+7. **`scan all` runs all 6 screeners** — stocks appearing in multiple are stronger signals
+8. **Use `--min-score 0.8`** to surface near-miss stocks that might pass tomorrow
+9. **For Indian stocks**, use `-m india` (NSE) or `-m india-bse` (BSE)
+10. **Rate limiting is per-process** — running multiple processes defeats it entirely
+11. **Disk cache (24h)** avoids redundant API calls — use `--no-cache` to force refresh
+12. **`backtest --strategy`** runs scan→backtest in one step, no CSV intermediary needed
+13. **Use `inspect` first** for single-stock deep analysis before running broad scans
+14. **Check `meta.tickers_failed`** in scan output to detect data quality issues
+15. **Use `version --output json`** to discover available strategies and markets
 
 ## Example: Multi-Step Workflow (Sequential)
 

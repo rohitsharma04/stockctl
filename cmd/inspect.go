@@ -24,7 +24,10 @@ including all indicator values and per-screener filter breakdown.`,
 	RunE: runInspect,
 }
 
+var inspectDate string
+
 func init() {
+	inspectCmd.Flags().StringVar(&inspectDate, "date", "", "analysis date (YYYY-MM-DD), default: latest")
 	rootCmd.AddCommand(inspectCmd)
 }
 
@@ -71,6 +74,17 @@ func runInspect(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 	startTime := time.Now()
 
+	// Parse --date for historical analysis
+	var asOfDate time.Time
+	if inspectDate != "" {
+		var err error
+		asOfDate, err = time.Parse("2006-01-02", inspectDate)
+		if err != nil {
+			return fmt.Errorf("invalid --date format (expected YYYY-MM-DD): %w", err)
+		}
+		logf("📅 Historical analysis as of: %s\n", asOfDate.Format("2006-01-02"))
+	}
+
 	fullTicker := activeMarket.ApplySuffix(ticker)
 	provider := marketdata.BuildProvider(noCache)
 
@@ -81,6 +95,14 @@ func runInspect(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("fetching data for %s: %w", fullTicker, err)
 	}
 
+	// Truncate data to as-of date
+	if !asOfDate.IsZero() {
+		data, err = marketdata.TruncateAt(data, asOfDate)
+		if err != nil {
+			return fmt.Errorf("truncating data for %s to %s: %w", fullTicker, asOfDate.Format("2006-01-02"), err)
+		}
+	}
+
 	if len(data) < 50 {
 		return fmt.Errorf("insufficient data for %s: only %d bars", fullTicker, len(data))
 	}
@@ -88,6 +110,9 @@ func runInspect(cmd *cobra.Command, args []string) error {
 	// Fetch benchmark
 	var benchmark []marketdata.OHLCV
 	benchmark, _ = provider.GetHistory(ctx, activeMarket.Benchmark, "5y", "1d")
+	if !asOfDate.IsZero() && benchmark != nil {
+		benchmark, _ = marketdata.TruncateAt(benchmark, asOfDate)
+	}
 
 	closes := marketdata.Closes(data)
 	opens := marketdata.Opens(data)
@@ -113,10 +138,13 @@ func runInspect(cmd *cobra.Command, args []string) error {
 		momentum = (closes[n-1] - closes[n-23]) / closes[n-23]
 	}
 
+	// Determine display date
+	displayDate := data[len(data)-1].Date.Format("2006-01-02")
+
 	result := inspectResult{
 		Ticker: fullTicker,
 		Market: activeMarket.ID,
-		Date:   time.Now().Format("2006-01-02"),
+		Date:   displayDate,
 		Price: priceInfo{
 			Close:   closes[n-1],
 			Open:    opens[n-1],
@@ -159,6 +187,9 @@ func runInspect(cmd *cobra.Command, args []string) error {
 	case output.FormatJSON:
 		meta := output.NewMeta("inspect")
 		meta.Market = activeMarket.ID
+		if !asOfDate.IsZero() {
+			meta.AsOfDate = asOfDate.Format("2006-01-02")
+		}
 		meta.DurationMs = time.Since(startTime).Milliseconds()
 		env := output.Envelope{
 			Meta:    meta,

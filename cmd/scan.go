@@ -65,6 +65,17 @@ func runScan(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 	startTime := time.Now()
 
+	// Parse --date for historical analysis
+	var asOfDate time.Time
+	if scanDate != "" {
+		var err error
+		asOfDate, err = time.Parse("2006-01-02", scanDate)
+		if err != nil {
+			return fmt.Errorf("invalid --date format (expected YYYY-MM-DD): %w", err)
+		}
+		logf("📅 Historical analysis as of: %s\n", asOfDate.Format("2006-01-02"))
+	}
+
 	// Resolve config overrides
 	tf := appConfig.General.TickersFile
 	if tickersFile != "" {
@@ -131,6 +142,15 @@ func runScan(cmd *cobra.Command, args []string) error {
 		logf("⚠️  Could not fetch benchmark: %v (relative strength checks will be skipped)\n", err)
 	}
 
+	// Truncate benchmark data to the as-of date
+	if !asOfDate.IsZero() && benchmarkData != nil {
+		benchmarkData, err = marketdata.TruncateAt(benchmarkData, asOfDate)
+		if err != nil {
+			logf("⚠️  Could not truncate benchmark to %s: %v\n", asOfDate.Format("2006-01-02"), err)
+			benchmarkData = nil
+		}
+	}
+
 	// Run screening
 	if appConfig.General.Output == "csv" {
 		logf("📂 Output directory: %s\n", runDir)
@@ -143,7 +163,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 
 	for _, scr := range screeners {
 		logf("\n🔍 Running %s screener on %d tickers (workers: %d)...\n", scr.Name(), len(tickers), w)
-		results, errors := runScreener(ctx, scr, tickers, provider, benchmarkData, w)
+		results, errors := runScreener(ctx, scr, tickers, provider, benchmarkData, w, asOfDate)
 
 		totalFailed += len(errors)
 		allErrors = append(allErrors, errors...)
@@ -162,6 +182,9 @@ func runScan(cmd *cobra.Command, args []string) error {
 		meta := output.NewMeta("scan")
 		meta.Market = activeMarket.ID
 		meta.Strategy = strategy
+		if !asOfDate.IsZero() {
+			meta.AsOfDate = asOfDate.Format("2006-01-02")
+		}
 		meta.TickersScanned = totalScanned
 		meta.TickersFailed = totalFailed
 		meta.DurationMs = time.Since(startTime).Milliseconds()
@@ -185,7 +208,7 @@ type scanResult struct {
 }
 
 func runScreener(ctx context.Context, scr screener.Screener, tickers []string,
-	provider marketdata.Provider, benchmark []marketdata.OHLCV, workers int) ([]scanResult, []output.ErrorInfo) {
+	provider marketdata.Provider, benchmark []marketdata.OHLCV, workers int, asOfDate time.Time) ([]scanResult, []output.ErrorInfo) {
 
 	type job struct {
 		ticker string
@@ -214,6 +237,21 @@ func runScreener(ctx context.Context, scr screener.Screener, tickers []string,
 					mu.Unlock()
 					atomic.AddInt64(&processed, 1)
 					continue
+				}
+
+				// Truncate data to as-of date for historical analysis
+				if !asOfDate.IsZero() {
+					data, err = marketdata.TruncateAt(data, asOfDate)
+					if err != nil {
+						if verbose {
+							logf("  ⚠ %s: %v\n", j.ticker, err)
+						}
+						mu.Lock()
+						errors = append(errors, output.ErrorInfo{Ticker: j.ticker, Error: err.Error()})
+						mu.Unlock()
+						atomic.AddInt64(&processed, 1)
+						continue
+					}
 				}
 
 				result, err := scr.Screen(ctx, data, benchmark)

@@ -319,7 +319,7 @@ func buildEntriesFromScan(strategy string) ([]backtest.BreakoutEntry, error) {
 	}
 
 	for _, scr := range screeners {
-		results, _ := runScreener(ctx, scr, tickers, provider, benchmark, w)
+		results, _ := runScreener(ctx, scr, tickers, provider, benchmark, w, time.Time{})
 		for _, r := range results {
 			if r.Score < 1.0 {
 				continue // Only fully passing stocks for backtest
