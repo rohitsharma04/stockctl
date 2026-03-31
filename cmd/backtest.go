@@ -186,7 +186,7 @@ func runBacktest(cmd *cobra.Command, args []string) error {
 	// Strategy metrics for top TP levels
 	fmt.Println("\n🔍 Strategy Metrics (fixed SL=5%):")
 	tw2 := output.NewTableWriter(os.Stdout)
-	tw2.SetHeaders("TP%", "Sharpe", "Avg Return", "Win Rate")
+	tw2.SetHeaders("TP%", "Sharpe", "Avg Return", "Win Rate", "Avg Win", "Avg Loss", "Expectancy", "MaxDD", "Exposure")
 	for tp := tpMin; tp <= tpMax+0.001; tp += tpStep {
 		m := backtest.EvaluateStrategy(entries, tp, 0.05)
 		tw2.AddRow(
@@ -194,6 +194,11 @@ func runBacktest(cmd *cobra.Command, args []string) error {
 			fmt.Sprintf("%.2f", m.Sharpe),
 			fmt.Sprintf("%.2f%%", m.AvgReturn*100),
 			fmt.Sprintf("%.1f%%", m.WinRate*100),
+			fmt.Sprintf("%.2f%%", m.AvgWin*100),
+			fmt.Sprintf("%.2f%%", m.AvgLoss*100),
+			fmt.Sprintf("%.2f%%", m.Expectancy*100),
+			fmt.Sprintf("%.1f%%", m.MaxDrawdown*100),
+			fmt.Sprintf("%.0f%%", m.ExposurePct*100),
 		)
 	}
 	tw2.Render()
@@ -321,7 +326,7 @@ func buildEntriesFromScan(strategy string) ([]backtest.BreakoutEntry, error) {
 	}
 
 	for _, scr := range screeners {
-		results, _ := runScreener(ctx, scr, tickers, provider, benchmark, w, time.Time{})
+		results, _, _ := runScreenerV2(ctx, scr, tickers, provider, benchmark, w, time.Time{}, benchmark != nil)
 		for _, r := range results {
 			if r.Score < 1.0 {
 				continue // Only fully passing stocks for backtest

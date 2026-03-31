@@ -17,11 +17,17 @@ type TradeResult struct {
 
 // StrategyMetrics holds performance metrics for a TP/SL combination.
 type StrategyMetrics struct {
-	TP        float64
-	SL        float64
-	Sharpe    float64
-	AvgReturn float64
-	WinRate   float64
+	TP          float64 `json:"tp"`
+	SL          float64 `json:"sl"`
+	Sharpe      float64 `json:"sharpe"`
+	AvgReturn   float64 `json:"avg_return"`
+	WinRate     float64 `json:"win_rate"`
+	TotalTrades int     `json:"total_trades"`
+	AvgWin      float64 `json:"avg_win"`
+	AvgLoss     float64 `json:"avg_loss"`
+	Expectancy  float64 `json:"expectancy"`
+	MaxDrawdown float64 `json:"max_drawdown"`
+	ExposurePct float64 `json:"exposure_pct"` // fraction of trades that hit TP or SL (not timed out)
 }
 
 // BreakoutEntry represents a pre-processed breakout signal with entry data.
@@ -100,9 +106,12 @@ func evaluateCombo(entries []BreakoutEntry, tp, sl, capital float64) TradeResult
 	}
 }
 
-// EvaluateStrategy computes Sharpe, win rate, and avg return for a TP/SL combo.
+// EvaluateStrategy computes comprehensive performance metrics for a TP/SL combo.
 func EvaluateStrategy(entries []BreakoutEntry, tp, sl float64) StrategyMetrics {
 	var returns []float64
+	var wins []float64
+	var losses []float64
+	hitCount := 0 // trades that hit TP or SL (not timed out)
 
 	for _, entry := range entries {
 		tpPrice := entry.EntryPrice * (1 + tp)
@@ -127,7 +136,16 @@ func EvaluateStrategy(entries []BreakoutEntry, tp, sl float64) StrategyMetrics {
 			ret = entry.Closes[len(entry.Closes)-1]/entry.EntryPrice - 1
 		}
 
+		if hit {
+			hitCount++
+		}
+
 		returns = append(returns, ret)
+		if ret > 0 {
+			wins = append(wins, ret)
+		} else if ret < 0 {
+			losses = append(losses, ret)
+		}
 	}
 
 	avgReturn := indicators.Mean(returns)
@@ -137,15 +155,45 @@ func EvaluateStrategy(entries []BreakoutEntry, tp, sl float64) StrategyMetrics {
 		sharpe = avgReturn / std
 	}
 
-	winCount := 0.0
-	for _, r := range returns {
-		if r > 0 {
-			winCount++
-		}
-	}
 	winRate := 0.0
 	if len(returns) > 0 {
-		winRate = winCount / float64(len(returns))
+		winRate = float64(len(wins)) / float64(len(returns))
+	}
+
+	avgWin := indicators.Mean(wins)
+	avgLoss := 0.0
+	if len(losses) > 0 {
+		avgLoss = indicators.Mean(losses)
+	}
+
+	// Expectancy = (WinRate * AvgWin) + ((1 - WinRate) * AvgLoss)
+	// AvgLoss is negative, so this naturally subtracts
+	expectancy := 0.0
+	if len(returns) > 0 {
+		expectancy = winRate*avgWin + (1-winRate)*avgLoss
+	}
+
+	// Max drawdown from cumulative returns
+	maxDrawdown := 0.0
+	if len(returns) > 0 {
+		cumulative := 1.0
+		peak := 1.0
+		for _, r := range returns {
+			cumulative *= (1 + r)
+			if cumulative > peak {
+				peak = cumulative
+			}
+			dd := (peak - cumulative) / peak
+			if dd > maxDrawdown {
+				maxDrawdown = dd
+			}
+		}
+	}
+
+	// Exposure: fraction of trades that hit TP or SL
+	exposurePct := 0.0
+	if len(returns) > 0 {
+		exposurePct = float64(hitCount) / float64(len(returns))
 	}
 
 	if math.IsNaN(sharpe) {
@@ -154,12 +202,31 @@ func EvaluateStrategy(entries []BreakoutEntry, tp, sl float64) StrategyMetrics {
 	if math.IsNaN(avgReturn) {
 		avgReturn = 0
 	}
+	if math.IsNaN(avgWin) {
+		avgWin = 0
+	}
+	if math.IsNaN(avgLoss) {
+		avgLoss = 0
+	}
+	if math.IsNaN(expectancy) {
+		expectancy = 0
+	}
+	if math.IsNaN(maxDrawdown) {
+		maxDrawdown = 0
+	}
 
 	return StrategyMetrics{
-		TP:        tp,
-		SL:        sl,
-		Sharpe:    sharpe,
-		AvgReturn: avgReturn,
-		WinRate:   winRate,
+		TP:          tp,
+		SL:          sl,
+		Sharpe:      sharpe,
+		AvgReturn:   avgReturn,
+		WinRate:     winRate,
+		TotalTrades: len(returns),
+		AvgWin:      avgWin,
+		AvgLoss:     avgLoss,
+		Expectancy:  expectancy,
+		MaxDrawdown: maxDrawdown,
+		ExposurePct: exposurePct,
 	}
 }
+

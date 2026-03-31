@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/csv"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/rohitsharma04/stockctl/internal/indicators"
 	"github.com/rohitsharma04/stockctl/internal/marketdata"
 	"github.com/rohitsharma04/stockctl/internal/output"
 	"github.com/rohitsharma04/stockctl/internal/screener"
@@ -21,15 +23,16 @@ import (
 )
 
 var (
-	scanDate    string
-	tickersFile string
-	minPrice    float64
-	workers     int
-	months      int
-	minScore    float64
-	sortBy      string
-	scanDetail  bool
-	scanDryRun  bool
+	scanDate       string
+	tickersFile    string
+	minPrice       float64
+	workers        int
+	months         int
+	minScore       float64
+	sortBy         string
+	scanDetail     bool
+	scanDryRun     bool
+	minTradedValue float64
 )
 
 var scanCmd = &cobra.Command{
@@ -64,7 +67,51 @@ func init() {
 	scanCmd.Flags().StringVar(&sortBy, "sort", "score", "sort results by: score, ticker, filters")
 	scanCmd.Flags().BoolVar(&scanDetail, "detail", false, "include per-filter breakdown in results")
 	scanCmd.Flags().BoolVar(&scanDryRun, "dry-run", false, "show scan plan without fetching data")
+	scanCmd.Flags().Float64Var(&minTradedValue, "min-traded-value", 0, "minimum 20-day avg traded value (price × volume)")
 	rootCmd.AddCommand(scanCmd)
+}
+
+// scanResult is the per-ticker output in scan results.
+type scanResult struct {
+	Ticker            string                  `json:"ticker"`
+	Strategy          string                  `json:"strategy"`
+	Score             float64                 `json:"score"`
+	WeightedScore     float64                 `json:"weighted_score"`
+	DataConfidence    float64                 `json:"data_confidence"`
+	ActionabilityScore float64               `json:"actionability_score"`
+	FiltersPassed     int                     `json:"filters_passed"`
+	TotalFilters      int                     `json:"total_filters"`
+	ClosePrice        float64                 `json:"close_price,omitempty"`
+	Volume            float64                 `json:"volume,omitempty"`
+	ChangePct         float64                 `json:"change_pct,omitempty"`
+	// Actionable watchlist fields
+	Status            string                  `json:"status"`              // confirmed_breakout, early_breakout, watch, avoid
+	StatusReason      string                  `json:"status_reason"`       // volume_confirmation_missing, etc.
+	TriggerPrice      float64                 `json:"trigger_price,omitempty"`
+	TriggerType       string                  `json:"trigger_type,omitempty"`
+	InvalidationPrice float64                 `json:"invalidation_price,omitempty"`
+	DistToTriggerPct  float64                 `json:"dist_to_trigger_pct,omitempty"`
+	VolumeRatio       float64                 `json:"volume_ratio,omitempty"`
+	RequiredVolRatio  float64                 `json:"required_volume_ratio,omitempty"`
+	ATRStop           float64                 `json:"atr_stop,omitempty"`
+	// Data health
+	DataHealth        string                  `json:"data_health"`         // complete, partial, degraded
+	ResultWarnings    []string                `json:"warnings,omitempty"`
+	// Sector enrichment
+	Sector            string                  `json:"sector,omitempty"`
+	Industry          string                  `json:"industry,omitempty"`
+	CapTier           string                  `json:"cap_tier,omitempty"`
+	AvgTradedValue    float64                 `json:"avg_traded_value,omitempty"`
+	// Timeframe alignment
+	TimeframeAlignment string                 `json:"timeframe_alignment,omitempty"`
+	// Filters
+	Filters           []screener.FilterResult `json:"filters,omitempty"`
+}
+
+// scanEnvelope wraps scan results with market summary for JSON output.
+type scanEnvelope struct {
+	MarketSummary *screener.MarketSummary `json:"market_summary,omitempty"`
+	Results       []scanResult            `json:"results"`
 }
 
 func runScan(cmd *cobra.Command, args []string) error {
@@ -193,8 +240,14 @@ func runScan(cmd *cobra.Command, args []string) error {
 	// Fetch benchmark data for screeners that need it
 	logf("📊 Fetching benchmark data (%s)...\n", activeMarket.Benchmark)
 	benchmarkData, err := provider.GetHistory(ctx, activeMarket.Benchmark, "5y", "1d")
+	benchmarkAvailable := err == nil && benchmarkData != nil
+	var scanWarnings []output.Warning
 	if err != nil {
 		logf("⚠️  Could not fetch benchmark: %v (relative strength checks will be skipped)\n", err)
+		scanWarnings = append(scanWarnings, output.Warning{
+			Code:    "benchmark_missing",
+			Message: fmt.Sprintf("Could not fetch benchmark %s: %v", activeMarket.Benchmark, err),
+		})
 	}
 
 	// Truncate benchmark data to the as-of date
@@ -202,7 +255,12 @@ func runScan(cmd *cobra.Command, args []string) error {
 		benchmarkData, err = marketdata.TruncateAt(benchmarkData, asOfDate)
 		if err != nil {
 			logf("⚠️  Could not truncate benchmark to %s: %v\n", asOfDate.Format("2006-01-02"), err)
+			scanWarnings = append(scanWarnings, output.Warning{
+				Code:    "benchmark_truncation_failed",
+				Message: fmt.Sprintf("Benchmark truncation to %s failed: %v", asOfDate.Format("2006-01-02"), err),
+			})
 			benchmarkData = nil
+			benchmarkAvailable = false
 		}
 	}
 
@@ -213,15 +271,19 @@ func runScan(cmd *cobra.Command, args []string) error {
 
 	var allResults []scanResult
 	var allErrors []output.ErrorInfo
+	var breadthData []screener.TickerBreadthData
 	totalScanned := len(tickers)
 	totalFailed := 0
+	tickersComplete := 0
+	tickersPartial := 0
 
 	for _, scr := range screeners {
 		logf("\n🔍 Running %s screener on %d tickers (workers: %d)...\n", scr.Name(), len(tickers), w)
-		results, errors := runScreener(ctx, scr, tickers, provider, benchmarkData, w, asOfDate)
+		results, errors, tickerBreadth := runScreenerV2(ctx, scr, tickers, provider, benchmarkData, w, asOfDate, benchmarkAvailable)
 
 		totalFailed += len(errors)
 		allErrors = append(allErrors, errors...)
+		breadthData = append(breadthData, tickerBreadth...)
 
 		// Output results
 		logf("✅ %s: %d stocks passed\n", scr.Name(), len(results))
@@ -229,6 +291,44 @@ func runScan(cmd *cobra.Command, args []string) error {
 
 		if len(results) > 0 && appConfig.General.Output != "json" {
 			renderResults(scr.Name(), results, appConfig.General.Output)
+		}
+	}
+
+	// Count data health categories
+	for _, r := range allResults {
+		switch r.DataHealth {
+		case "complete":
+			tickersComplete++
+		case "partial", "degraded":
+			tickersPartial++
+		}
+	}
+
+	// Compute market summary
+	var mktSummary *screener.MarketSummary
+	if len(breadthData) > 0 {
+		breadth := screener.ComputeBreadth(breadthData)
+		var benchStatus screener.BenchmarkStatus
+		if benchmarkData != nil {
+			benchStatus = screener.ComputeBenchmarkStatus(activeMarket.Benchmark, benchmarkData)
+		} else {
+			benchStatus = screener.BenchmarkStatus{Symbol: activeMarket.Benchmark, TrendLabel: "unavailable"}
+		}
+
+		displayDate := time.Now().Format("2006-01-02")
+		if !asOfDate.IsZero() {
+			displayDate = asOfDate.Format("2006-01-02")
+		}
+
+		sectorBreadth := screener.ComputeSectorBreadth(breadthData)
+
+		mktSummary = &screener.MarketSummary{
+			MarketID:      activeMarket.ID,
+			MarketName:    activeMarket.Name,
+			AsOfDate:      displayDate,
+			Benchmark:     benchStatus,
+			Breadth:       breadth,
+			SectorBreadth: sectorBreadth,
 		}
 	}
 
@@ -261,10 +361,25 @@ func runScan(cmd *cobra.Command, args []string) error {
 		meta.TickersScanned = totalScanned
 		meta.TickersFailed = totalFailed
 		meta.DurationMs = time.Since(startTime).Milliseconds()
+		meta.DataQuality = &output.DataQualitySummary{
+			BenchmarkAvailable: benchmarkAvailable,
+			BenchmarkSymbol:    activeMarket.Benchmark,
+			BenchmarkBars:      len(benchmarkData),
+			TickersComplete:    tickersComplete,
+			TickersPartial:     tickersPartial,
+			TickersFailed:      totalFailed,
+		}
+
+		envResults := scanEnvelope{
+			MarketSummary: mktSummary,
+			Results:       allResults,
+		}
+
 		env := output.Envelope{
-			Meta:    meta,
-			Results: allResults,
-			Errors:  allErrors,
+			Meta:     meta,
+			Results:  envResults,
+			Errors:   allErrors,
+			Warnings: scanWarnings,
 		}
 		return output.WriteEnvelope(os.Stdout, env)
 	}
@@ -272,20 +387,18 @@ func runScan(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-type scanResult struct {
-	Ticker        string                  `json:"ticker"`
-	Strategy      string                  `json:"strategy"`
-	Score         float64                 `json:"score"`
-	FiltersPassed int                     `json:"filters_passed"`
-	TotalFilters  int                     `json:"total_filters"`
-	ClosePrice    float64                 `json:"close_price,omitempty"`
-	Volume        float64                 `json:"volume,omitempty"`
-	ChangePct     float64                 `json:"change_pct,omitempty"`
-	Filters       []screener.FilterResult `json:"filters,omitempty"`
+// tickerScanData holds per-ticker metadata collected during screening.
+type tickerScanData struct {
+	data        []marketdata.OHLCV
+	aboveSMA50  bool
+	aboveSMA200 bool
+	newHigh     bool
+	newLow      bool
 }
 
-func runScreener(ctx context.Context, scr screener.Screener, tickers []string,
-	provider marketdata.Provider, benchmark []marketdata.OHLCV, workers int, asOfDate time.Time) ([]scanResult, []output.ErrorInfo) {
+func runScreenerV2(ctx context.Context, scr screener.Screener, tickers []string,
+	provider marketdata.Provider, benchmark []marketdata.OHLCV, workers int, asOfDate time.Time,
+	benchmarkAvailable bool) ([]scanResult, []output.ErrorInfo, []screener.TickerBreadthData) {
 
 	screenerStart := time.Now()
 	type job struct {
@@ -295,6 +408,7 @@ func runScreener(ctx context.Context, scr screener.Screener, tickers []string,
 	jobs := make(chan job, len(tickers))
 	var results []scanResult
 	var errors []output.ErrorInfo
+	var breadthData []screener.TickerBreadthData
 	var mu sync.Mutex
 	var processed int64
 	total := int64(len(tickers))
@@ -332,6 +446,9 @@ func runScreener(ctx context.Context, scr screener.Screener, tickers []string,
 					}
 				}
 
+				// Compute breadth metrics from data
+				tbd := computeTickerBreadth(j.ticker, data)
+
 				result, err := scr.Screen(ctx, data, benchmark)
 				if err != nil {
 					if verbose {
@@ -344,6 +461,20 @@ func runScreener(ctx context.Context, scr screener.Screener, tickers []string,
 					continue
 				}
 
+				// Enrich breadth with score/pass
+				tbd.Score = result.Score
+				tbd.FullPass = result.Pass
+
+				// Sector enrichment
+				sectorInfo, hasSector := marketdata.GetSectorInfo(j.ticker)
+				if hasSector {
+					tbd.Sector = sectorInfo.Sector
+				}
+
+				mu.Lock()
+				breadthData = append(breadthData, tbd)
+				mu.Unlock()
+
 				if result.Score >= minScore {
 					passed := 0
 					for _, f := range result.Filters {
@@ -352,7 +483,7 @@ func runScreener(ctx context.Context, scr screener.Screener, tickers []string,
 						}
 					}
 
-					// Extract price data from already-fetched data
+					// Extract price data
 					dn := len(data)
 					closePrice := data[dn-1].Close
 					volume := data[dn-1].Volume
@@ -361,16 +492,58 @@ func runScreener(ctx context.Context, scr screener.Screener, tickers []string,
 						changePct = (data[dn-1].Close - data[dn-2].Close) / data[dn-2].Close
 					}
 
-					sr := scanResult{
-						Ticker:        j.ticker,
-						Strategy:      scr.Name(),
-						Score:         result.Score,
-						FiltersPassed: passed,
-						TotalFilters:  len(result.Filters),
-						ClosePrice:    closePrice,
-						Volume:        volume,
-						ChangePct:     changePct,
+					// Compute actionable fields
+					status, statusReason := deriveStatus(result)
+					triggerPrice, triggerType, invalidationPrice, atrStop, distToTrigger := computeActionableFields(data, result)
+					volRatio, reqVolRatio := extractVolumeRatio(result)
+					dataHealth, warnings := assessDataHealth(result, benchmarkAvailable)
+
+					// Compute avg traded value
+					avgTradedValue := computeAvgTradedValue(data)
+
+					// Min traded value filter
+					if minTradedValue > 0 && avgTradedValue < minTradedValue {
+						atomic.AddInt64(&processed, 1)
+						continue
 					}
+
+					// Timeframe alignment
+					tfAlignment := computeTimeframeAlignment(data)
+
+					sr := scanResult{
+						Ticker:             j.ticker,
+						Strategy:           scr.Name(),
+						Score:              result.Score,
+						WeightedScore:      result.WeightedScore,
+						DataConfidence:     result.DataConfidence,
+						ActionabilityScore: result.ActionabilityScore,
+						FiltersPassed:      passed,
+						TotalFilters:       len(result.Filters),
+						ClosePrice:         closePrice,
+						Volume:             volume,
+						ChangePct:          changePct,
+						Status:             status,
+						StatusReason:       statusReason,
+						TriggerPrice:       triggerPrice,
+						TriggerType:        triggerType,
+						InvalidationPrice:  invalidationPrice,
+						DistToTriggerPct:   distToTrigger,
+						VolumeRatio:        volRatio,
+						RequiredVolRatio:   reqVolRatio,
+						ATRStop:            atrStop,
+						DataHealth:         dataHealth,
+						ResultWarnings:     warnings,
+						TimeframeAlignment: tfAlignment,
+					}
+
+					// Sector enrichment
+					if hasSector {
+						sr.Sector = sectorInfo.Sector
+						sr.Industry = sectorInfo.Industry
+						sr.CapTier = sectorInfo.CapTier
+					}
+					sr.AvgTradedValue = avgTradedValue
+
 					if scanDetail {
 						sr.Filters = result.Filters
 					}
@@ -393,7 +566,224 @@ func runScreener(ctx context.Context, scr screener.Screener, tickers []string,
 	close(jobs)
 	wg.Wait()
 
-	return results, errors
+	return results, errors, breadthData
+}
+
+// computeTickerBreadth computes SMA50/200 and 52-week high/low for breadth.
+func computeTickerBreadth(ticker string, data []marketdata.OHLCV) screener.TickerBreadthData {
+	tbd := screener.TickerBreadthData{Ticker: ticker}
+	if len(data) < 201 {
+		return tbd
+	}
+	closes := marketdata.Closes(data)
+	n := len(closes)
+
+	sma50 := indicators.SMA(closes, 50)
+	sma200 := indicators.SMA(closes, 200)
+
+	tbd.AboveSMA50 = !math.IsNaN(sma50[n-1]) && closes[n-1] > sma50[n-1]
+	tbd.AboveSMA200 = !math.IsNaN(sma200[n-1]) && closes[n-1] > sma200[n-1]
+
+	// 52-week high/low check
+	tail252 := indicators.Tail(closes, 252)
+	high52w := indicators.Max(tail252)
+	low52w := indicators.Min(tail252)
+	tbd.NewHigh = closes[n-1] >= high52w*0.98 // within 2% of 52w high
+	tbd.NewLow = closes[n-1] <= low52w*1.02   // within 2% of 52w low
+
+	return tbd
+}
+
+// deriveStatus determines the watchlist status and reason from screening result.
+func deriveStatus(result *screener.ScreenResult) (string, string) {
+	if result.Pass && result.DataConfidence >= 0.9 {
+		// Check if volume is confirmed
+		for _, f := range result.Filters {
+			if (f.Name == "volume_spike" || f.Name == "volume_confirmation" || f.Name == "volume_explosion") && !f.Pass {
+				return "early_breakout", "volume_confirmation_missing"
+			}
+		}
+		return "confirmed_breakout", ""
+	}
+
+	// Near miss
+	if result.Score >= 0.67 {
+		// Find the most important failing filter
+		reason := findFailingReason(result)
+		if result.DataConfidence < 0.8 {
+			return "watch", "insufficient_data_confidence"
+		}
+		return "watch", reason
+	}
+
+	if result.Score >= 0.5 {
+		reason := findFailingReason(result)
+		return "watch", reason
+	}
+
+	return "avoid", findFailingReason(result)
+}
+
+// findFailingReason returns the status_reason string from the most important failing filter.
+func findFailingReason(result *screener.ScreenResult) string {
+	// Priority: critical unknown > critical fail > major unknown > major fail
+	for _, imp := range []string{screener.ImportanceCritical, screener.ImportanceMajor, screener.ImportanceMinor} {
+		for _, f := range result.Filters {
+			if f.Importance == imp && f.Status == screener.StatusUnknown {
+				return f.Name + "_unknown"
+			}
+		}
+		for _, f := range result.Filters {
+			if f.Importance == imp && f.Status == screener.StatusFail {
+				return f.Name + "_failed"
+			}
+		}
+	}
+	return "multiple_filters_failed"
+}
+
+// computeActionableFields derives trigger, invalidation, and ATR stop from filter data.
+func computeActionableFields(data []marketdata.OHLCV, result *screener.ScreenResult) (triggerPrice float64, triggerType string, invalidationPrice, atrStop, distToTrigger float64) {
+	if len(data) < 20 {
+		return
+	}
+	n := len(data)
+	closes := marketdata.Closes(data)
+	highs := marketdata.Highs(data)
+	lows := marketdata.Lows(data)
+
+	// Trigger from bollinger upper band
+	for _, f := range result.Filters {
+		if f.Name == "bollinger_breakout" && f.Threshold > 0 {
+			triggerPrice = f.Threshold
+			triggerType = "bollinger_breakout"
+			if closes[n-1] > 0 {
+				distToTrigger = (triggerPrice - closes[n-1]) / closes[n-1]
+			}
+		}
+		if f.Name == "trendline_breakout" && f.Threshold > 0 && triggerPrice == 0 {
+			triggerPrice = f.Threshold
+			triggerType = "trendline_breakout"
+			if closes[n-1] > 0 {
+				distToTrigger = (triggerPrice - closes[n-1]) / closes[n-1]
+			}
+		}
+	}
+
+	// ATR-based stop and invalidation
+	atrValues := indicators.ATR(highs, lows, closes, 14)
+	if len(atrValues) > 0 && !math.IsNaN(atrValues[n-1]) {
+		atrStop = closes[n-1] - 1.5*atrValues[n-1]
+		if invalidationPrice == 0 {
+			sma := indicators.SMA(closes, 10)
+			if !math.IsNaN(sma[n-1]) {
+				invalidationPrice = sma[n-1] - 1.5*atrValues[n-1]
+			} else {
+				invalidationPrice = atrStop
+			}
+		}
+	}
+
+	return
+}
+
+// extractVolumeRatio finds volume ratio from filter results.
+func extractVolumeRatio(result *screener.ScreenResult) (volRatio, reqVolRatio float64) {
+	for _, f := range result.Filters {
+		if f.Name == "volume_spike" || f.Name == "volume_confirmation" || f.Name == "volume_explosion" {
+			return f.Value, f.Threshold
+		}
+	}
+	return 0, 0
+}
+
+// assessDataHealth derives overall data health and per-ticker warnings.
+func assessDataHealth(result *screener.ScreenResult, benchmarkAvailable bool) (string, []string) {
+	var warnings []string
+	unknowns := 0
+	for _, f := range result.Filters {
+		if f.Status == screener.StatusUnknown {
+			unknowns++
+			warnings = append(warnings, fmt.Sprintf("%s: %s", f.Name, f.Detail))
+		}
+	}
+
+	if !benchmarkAvailable {
+		warnings = append(warnings, "benchmark data not available for relative strength")
+	}
+
+	if unknowns == 0 {
+		return "complete", warnings
+	}
+	if unknowns <= 1 {
+		return "partial", warnings
+	}
+	return "degraded", warnings
+}
+
+// computeAvgTradedValue calculates 20-day average of price × volume.
+func computeAvgTradedValue(data []marketdata.OHLCV) float64 {
+	n := len(data)
+	window := 20
+	if n < window {
+		window = n
+	}
+	total := 0.0
+	for i := n - window; i < n; i++ {
+		total += data[i].Close * data[i].Volume
+	}
+	if window == 0 {
+		return 0
+	}
+	return total / float64(window)
+}
+
+// computeTimeframeAlignment checks weekly/monthly SMA alignment.
+func computeTimeframeAlignment(data []marketdata.OHLCV) string {
+	if len(data) < 60 {
+		return "insufficient_data"
+	}
+
+	// Weekly alignment
+	weekly := marketdata.ToWeekly(data)
+	wn := len(weekly)
+	weeklyAligned := false
+	if wn >= 12 {
+		wCloses := make([]float64, wn)
+		for i, w := range weekly {
+			wCloses[i] = w.Close
+		}
+		wSMA10 := indicators.SMA(wCloses, 10)
+		if !math.IsNaN(wSMA10[wn-1]) && wCloses[wn-1] > wSMA10[wn-1] {
+			weeklyAligned = true
+		}
+	}
+
+	// Monthly alignment
+	monthly := marketdata.ToMonthly(data)
+	mn := len(monthly)
+	monthlyAligned := false
+	if mn >= 12 {
+		mCloses := make([]float64, mn)
+		for i, m := range monthly {
+			mCloses[i] = m.Close
+		}
+		mSMA10 := indicators.SMA(mCloses, 10)
+		if !math.IsNaN(mSMA10[mn-1]) && mCloses[mn-1] > mSMA10[mn-1] {
+			monthlyAligned = true
+		}
+	}
+
+	switch {
+	case weeklyAligned && monthlyAligned:
+		return "daily+weekly+monthly"
+	case weeklyAligned:
+		return "daily+weekly"
+	case monthlyAligned:
+		return "counter_trend"
+	default:
+		return "daily_only"
+	}
 }
 
 func renderResults(strategyName string, results []scanResult, format string) {
@@ -404,10 +794,10 @@ func renderResults(strategyName string, results []scanResult, format string) {
 
 	case output.FormatCSV:
 		filename := filepath.Join(runDir, fmt.Sprintf("%s_%s.csv", strategyName, time.Now().Format("2006-01-02_150405")))
-		headers := []string{"Ticker", "Strategy", "Score", "Filters Passed", "Total Filters"}
+		headers := []string{"Ticker", "Strategy", "Score", "Status", "StatusReason", "Filters Passed", "Total Filters"}
 		var rows [][]string
 		for _, r := range results {
-			rows = append(rows, []string{r.Ticker, r.Strategy, fmt.Sprintf("%.2f", r.Score), fmt.Sprintf("%d", r.FiltersPassed), fmt.Sprintf("%d", r.TotalFilters)})
+			rows = append(rows, []string{r.Ticker, r.Strategy, fmt.Sprintf("%.2f", r.Score), r.Status, r.StatusReason, fmt.Sprintf("%d", r.FiltersPassed), fmt.Sprintf("%d", r.TotalFilters)})
 		}
 		if err := output.WriteCSV(filename, headers, rows); err != nil {
 			fmt.Fprintf(os.Stderr, "Error writing CSV: %v\n", err)
@@ -417,9 +807,9 @@ func renderResults(strategyName string, results []scanResult, format string) {
 
 	default: // table
 		tw := output.NewTableWriter(os.Stdout)
-		tw.SetHeaders("Ticker", "Strategy", "Score", "Filters")
+		tw.SetHeaders("Ticker", "Strategy", "Score", "Status", "Filters")
 		for _, r := range results {
-			tw.AddRow(r.Ticker, r.Strategy, fmt.Sprintf("%.0f%%", r.Score*100), fmt.Sprintf("%d/%d", r.FiltersPassed, r.TotalFilters))
+			tw.AddRow(r.Ticker, r.Strategy, fmt.Sprintf("%.0f%%", r.Score*100), r.Status, fmt.Sprintf("%d/%d", r.FiltersPassed, r.TotalFilters))
 		}
 		tw.Render()
 	}
@@ -481,4 +871,3 @@ func loadTickers(path string) ([]string, error) {
 	}
 	return tickers, scanner.Err()
 }
-

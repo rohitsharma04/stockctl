@@ -10,10 +10,11 @@ import (
 
 // DescendingBreakout screens for descending triangle breakouts.
 type DescendingBreakout struct {
-	cfg config.ScreenerConfig
+	cfg     config.ScreenerConfig
+	scoring config.ScoringConfig
 }
 
-func NewDescendingBreakout(cfg config.ScreenerConfig) *DescendingBreakout {
+func NewDescendingBreakout(cfg config.ScreenerConfig, scoring config.ScoringConfig) *DescendingBreakout {
 	if cfg.Months == 0 {
 		cfg.Months = 36
 	}
@@ -26,7 +27,7 @@ func NewDescendingBreakout(cfg config.ScreenerConfig) *DescendingBreakout {
 	if cfg.MinDataDays == 0 {
 		cfg.MinDataDays = 756
 	}
-	return &DescendingBreakout{cfg: cfg}
+	return &DescendingBreakout{cfg: cfg, scoring: scoring}
 }
 
 func (d *DescendingBreakout) Name() string        { return "descending-breakout" }
@@ -35,7 +36,7 @@ func (d *DescendingBreakout) Description() string  { return "Descending triangle
 func (d *DescendingBreakout) Screen(_ context.Context, data []marketdata.OHLCV, _ []marketdata.OHLCV) (*ScreenResult, error) {
 	if len(data) < d.cfg.MinDataDays {
 		return &ScreenResult{Pass: false, Score: 0, Filters: []FilterResult{
-			{Name: "min_data", Pass: false, Value: float64(len(data)), Threshold: float64(d.cfg.MinDataDays)},
+			MakeFilter("min_data", false, float64(len(data)), float64(d.cfg.MinDataDays), ImportanceMinor, "insufficient data"),
 		}}, nil
 	}
 
@@ -43,23 +44,23 @@ func (d *DescendingBreakout) Screen(_ context.Context, data []marketdata.OHLCV, 
 	n := len(closes)
 	var filters []FilterResult
 
-	// 1. Min price
-	filters = append(filters, FilterResult{
-		Name: "min_price", Pass: closes[n-1] > 5.0, Value: closes[n-1], Threshold: 5.0,
-	})
+	// 1. Min price (minor)
+	filters = append(filters, MakeFilter(
+		"min_price", closes[n-1] > 5.0, closes[n-1], 5.0, ImportanceMinor, "",
+	))
 
 	// Resample to monthly
 	monthly := marketdata.ToMonthly(data)
 	mn := len(monthly)
 	if mn < d.cfg.Months {
 		return &ScreenResult{Pass: false, Score: 0, Filters: []FilterResult{
-			{Name: "min_monthly_data", Pass: false, Value: float64(mn), Threshold: float64(d.cfg.Months)},
+			MakeFilter("min_monthly_data", false, float64(mn), float64(d.cfg.Months), ImportanceMinor, "insufficient monthly data"),
 		}}, nil
 	}
 
 	triangleData := monthly[mn-d.cfg.Months:]
 
-	// 2. Descending highs: progressively lower highs with tolerance for false breakouts
+	// 2. Descending highs (critical)
 	peak := triangleData[0].High
 	falseBreakouts := 0
 	descPass := true
@@ -74,12 +75,12 @@ func (d *DescendingBreakout) Screen(_ context.Context, data []marketdata.OHLCV, 
 			peak = triangleData[i].High
 		}
 	}
-	filters = append(filters, FilterResult{
-		Name: "descending_highs", Pass: descPass, Value: float64(falseBreakouts), Threshold: float64(d.cfg.FalseBreakoutTolerance),
-		Detail: fmt.Sprintf("%d false breakouts (max %d)", falseBreakouts, d.cfg.FalseBreakoutTolerance),
-	})
+	filters = append(filters, MakeFilter(
+		"descending_highs", descPass, float64(falseBreakouts), float64(d.cfg.FalseBreakoutTolerance), ImportanceCritical,
+		fmt.Sprintf("%d false breakouts (max %d)", falseBreakouts, d.cfg.FalseBreakoutTolerance),
+	))
 
-	// 3. Trendline breakout: current close above projected descending trendline
+	// 3. Trendline breakout (critical)
 	highFirst := triangleData[0].High
 	highLast := triangleData[len(triangleData)-2].High
 	numPoints := float64(len(triangleData) - 1)
@@ -88,12 +89,12 @@ func (d *DescendingBreakout) Screen(_ context.Context, data []marketdata.OHLCV, 
 
 	currentClose := triangleData[len(triangleData)-1].Close
 	trendPass := currentClose > trendlineValue
-	filters = append(filters, FilterResult{
-		Name: "trendline_breakout", Pass: trendPass, Value: currentClose, Threshold: trendlineValue,
-		Detail: fmt.Sprintf("close %.2f vs trendline %.2f", currentClose, trendlineValue),
-	})
+	filters = append(filters, MakeFilter(
+		"trendline_breakout", trendPass, currentClose, trendlineValue, ImportanceCritical,
+		fmt.Sprintf("close %.2f vs trendline %.2f", currentClose, trendlineValue),
+	))
 
-	// 4. Volume confirmation: last month volume > 1.5x average
+	// 4. Volume confirmation (critical)
 	avgVolume := 0.0
 	for i := 0; i < len(triangleData)-1; i++ {
 		avgVolume += triangleData[i].Volume
@@ -106,10 +107,10 @@ func (d *DescendingBreakout) Screen(_ context.Context, data []marketdata.OHLCV, 
 		volRatio = lastVolume / avgVolume
 	}
 	volPass := lastVolume > avgVolume*d.cfg.VolumeMultiplier
-	filters = append(filters, FilterResult{
-		Name: "volume_confirmation", Pass: volPass, Value: volRatio, Threshold: d.cfg.VolumeMultiplier,
-		Detail: fmt.Sprintf("%.2fx vs %.2fx required", volRatio, d.cfg.VolumeMultiplier),
-	})
+	filters = append(filters, MakeFilter(
+		"volume_confirmation", volPass, volRatio, d.cfg.VolumeMultiplier, ImportanceCritical,
+		fmt.Sprintf("%.2fx vs %.2fx required", volRatio, d.cfg.VolumeMultiplier),
+	))
 
-	return NewScreenResult(filters), nil
+	return NewScreenResultWeighted(filters, d.scoring), nil
 }

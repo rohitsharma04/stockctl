@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/rohitsharma04/stockctl/internal/config"
 	"github.com/rohitsharma04/stockctl/internal/indicators"
 	"github.com/rohitsharma04/stockctl/internal/marketdata"
 )
@@ -16,10 +17,12 @@ import (
 //  2. Current RSI(14) is between 30 and 60 (not overbought)
 //  3. Price above SMA(50) (uptrend support)
 //  4. Volume > 1.2x 20-day average (participation confirmation)
-type RSIBounce struct{}
+type RSIBounce struct {
+	scoring config.ScoringConfig
+}
 
-func NewRSIBounce() *RSIBounce {
-	return &RSIBounce{}
+func NewRSIBounce(scoring config.ScoringConfig) *RSIBounce {
+	return &RSIBounce{scoring: scoring}
 }
 
 func (r *RSIBounce) Name() string        { return "rsi-bounce" }
@@ -39,7 +42,7 @@ func (r *RSIBounce) Screen(ctx context.Context, data []marketdata.OHLCV, benchma
 	sma50 := indicators.SMA(closes, 50)
 	avgVol := indicators.Mean(indicators.Tail(volumes, 20))
 
-	// Filter 1: RSI crossed above 30 in last 5 days
+	// Filter 1: RSI crossed above 30 in last 5 days (critical)
 	rsiBounced := false
 	for i := n - 5; i < n; i++ {
 		if i > 0 && !math.IsNaN(rsi[i]) && !math.IsNaN(rsi[i-1]) {
@@ -50,26 +53,52 @@ func (r *RSIBounce) Screen(ctx context.Context, data []marketdata.OHLCV, benchma
 		}
 	}
 
-	// Filter 2: Current RSI between 30 and 60
 	currentRSI := rsi[n-1]
-	rsiInRange := !math.IsNaN(currentRSI) && currentRSI >= 30 && currentRSI <= 60
+	if math.IsNaN(currentRSI) {
+		return NewScreenResultWeighted([]FilterResult{
+			MakeUnknownFilter("rsi_bounce", ImportanceCritical, "RSI not available"),
+			MakeUnknownFilter("rsi_in_range", ImportanceMajor, "RSI not available"),
+			MakeUnknownFilter("price_above_sma50", ImportanceMajor, "depends on RSI availability"),
+			MakeUnknownFilter("volume_confirmation", ImportanceCritical, "depends on RSI availability"),
+		}, r.scoring), nil
+	}
 
-	// Filter 3: Price above SMA(50)
-	aboveSMA50 := !math.IsNaN(sma50[n-1]) && closes[n-1] > sma50[n-1]
+	var filters []FilterResult
 
-	// Filter 4: Volume confirmation
+	filters = append(filters, MakeFilter(
+		"rsi_bounce", rsiBounced, currentRSI, 30, ImportanceCritical,
+		fmt.Sprintf("RSI=%.1f", currentRSI),
+	))
+
+	// Filter 2: Current RSI between 30 and 60 (major)
+	rsiInRange := currentRSI >= 30 && currentRSI <= 60
+	filters = append(filters, MakeFilter(
+		"rsi_in_range", rsiInRange, currentRSI, 60, ImportanceMajor,
+		fmt.Sprintf("RSI=%.1f", currentRSI),
+	))
+
+	// Filter 3: Price above SMA(50) (major)
+	if math.IsNaN(sma50[n-1]) {
+		filters = append(filters, MakeUnknownFilter(
+			"price_above_sma50", ImportanceMajor, "SMA50 not available",
+		))
+	} else {
+		aboveSMA50 := closes[n-1] > sma50[n-1]
+		filters = append(filters, MakeFilter(
+			"price_above_sma50", aboveSMA50, closes[n-1], sma50[n-1], ImportanceMajor, "",
+		))
+	}
+
+	// Filter 4: Volume confirmation (critical)
 	volRatio := 0.0
 	if avgVol > 0 {
 		volRatio = volumes[n-1] / avgVol
 	}
 	volumeSpike := volRatio >= 1.2
+	filters = append(filters, MakeFilter(
+		"volume_confirmation", volumeSpike, volRatio, 1.2, ImportanceCritical,
+		fmt.Sprintf("%.1fx avg", volRatio),
+	))
 
-	filters := []FilterResult{
-		{Name: "RSI Bounce (crossed 30)", Pass: rsiBounced, Value: currentRSI, Threshold: 30, Detail: fmt.Sprintf("RSI=%.1f", currentRSI)},
-		{Name: "RSI in Range (30-60)", Pass: rsiInRange, Value: currentRSI, Threshold: 60, Detail: fmt.Sprintf("RSI=%.1f", currentRSI)},
-		{Name: "Price > SMA(50)", Pass: aboveSMA50, Value: closes[n-1], Threshold: sma50[n-1]},
-		{Name: "Volume > 1.2x Avg", Pass: volumeSpike, Value: volRatio, Threshold: 1.2, Detail: fmt.Sprintf("%.1fx avg", volRatio)},
-	}
-
-	return NewScreenResult(filters), nil
+	return NewScreenResultWeighted(filters, r.scoring), nil
 }

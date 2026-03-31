@@ -160,6 +160,7 @@ stockctl scan all --timeout 3m --output json --quiet
 | `--output / -o` | `table` | `table`, `json`, `csv` |
 | `--min-score` | `1.0` | Minimum score to include (0.0–1.0). Use `0.8` for near-misses |
 | `--min-price` | from market | Minimum stock price filter |
+| `--min-traded-value` | `0` | Minimum 20-day avg traded value (price × volume) for liquidity filtering |
 | `--sort` | `score` | Sort results by: `score`, `ticker`, `filters` |
 | `--detail` | `false` | Include per-filter breakdown in results |
 | `--dry-run` | `false` | Show scan plan without fetching data (instant) |
@@ -171,7 +172,7 @@ stockctl scan all --timeout 3m --output json --quiet
 ```json
 {
   "meta": {
-    "schema_version": "1.0",
+    "schema_version": "2.0",
     "command": "scan",
     "market": "us",
     "strategy": "breakout-caution",
@@ -179,24 +180,52 @@ stockctl scan all --timeout 3m --output json --quiet
     "tickers_scanned": 503,
     "tickers_failed": 5,
     "duration_ms": 45000,
-    "timestamp": "2026-03-26T17:00:00Z"
-  },
-  "results": [
-    {
-      "ticker": "AAPL", "strategy": "breakout-caution", "score": 1.0,
-      "filters_passed": 6, "total_filters": 6,
-      "close_price": 198.50, "volume": 52340000, "change_pct": 0.012
+    "timestamp": "2026-03-26T17:00:00Z",
+    "data_quality": {
+      "benchmark_available": true,
+      "benchmark_symbol": "^GSPC",
+      "benchmark_bars": 1258,
+      "tickers_complete": 490,
+      "tickers_partial": 8,
+      "tickers_failed": 5
     }
-  ],
-  "errors": [
-    {"ticker": "XYZ", "error": "no data returned"}
-  ]
+  },
+  "results": {
+    "market_summary": {
+      "market_id": "us",
+      "market_name": "S&P 500",
+      "benchmark": { "symbol": "^GSPC", "close": 5200.0, "above_sma50": true, "above_sma200": true, "trend_label": "uptrend" },
+      "breadth": { "total_scanned": 503, "full_passes": 12, "near_misses": 35, "pass_rate": 0.024, "above_sma50_pct": 0.65, "regime_label": "broad_risk_on" },
+      "sector_breadth": [{ "sector": "Technology", "tickers": 80, "passes": 5, "pass_rate": 0.063 }]
+    },
+    "results": [
+      {
+        "ticker": "AAPL", "strategy": "breakout-caution",
+        "score": 1.0, "weighted_score": 1.0, "data_confidence": 1.0, "actionability_score": 1.0,
+        "filters_passed": 6, "total_filters": 6,
+        "close_price": 198.50, "volume": 52340000, "change_pct": 0.012,
+        "status": "confirmed_breakout", "status_reason": "",
+        "trigger_price": 197.80, "trigger_type": "bollinger_breakout",
+        "invalidation_price": 190.50, "atr_stop": 192.30,
+        "volume_ratio": 2.1, "required_volume_ratio": 1.5,
+        "data_health": "complete",
+        "sector": "Technology", "industry": "Technology Hardware, Storage & Peripherals", "cap_tier": "large",
+        "timeframe_alignment": "daily+weekly+monthly"
+      }
+    ]
+  },
+  "errors": [{"ticker": "XYZ", "error": "no data returned"}],
+  "warnings": []
 }
 ```
 
-> Results now include `close_price`, `volume`, and `change_pct` — no need to run `inspect` just for price info.
-> When `--detail` is used, each result also includes a `filters` array with per-filter pass/fail and values.
-> `as_of_date` is only present when `--date` is used. If omitted, the analysis ran on the latest available data.
+> **Scoring**: Each result includes `score` (simple pass ratio), `weighted_score` (importance-weighted), `data_confidence` (fraction of filters with valid data), and `actionability_score` (weighted × confidence).
+> **Watchlist fields**: `status` (`confirmed_breakout`, `early_breakout`, `watch`, `avoid`), `status_reason`, `trigger_price`, `invalidation_price`, `atr_stop`, `volume_ratio` vs `required_volume_ratio`.
+> **Sector enrichment**: `sector`, `industry`, `cap_tier` from embedded classification (500 India tickers, 503 US tickers). `avg_traded_value` for liquidity filtering.
+> **Timeframe alignment**: `timeframe_alignment` shows multi-timeframe confirmation (`daily+weekly+monthly`, `daily+weekly`, `daily_only`, `counter_trend`).
+> **Market summary**: Top-level `market_summary` with benchmark trend, breadth metrics, sector breakdown, and regime label.
+> **Tri-state filters**: Each filter has `status` of `pass`, `fail`, or `unknown`. Unknown filters (missing/NaN data) never count as passes.
+> When `--detail` is used, each result also includes a `filters` array with per-filter pass/fail, status, importance, values, and thresholds.
 
 ### 2. `stockctl inspect <ticker>` — Single Stock Deep Analysis
 
@@ -278,6 +307,15 @@ stockctl backtest --strategy all -m india --output json
 # Custom ranges
 stockctl backtest --input signals.csv --tp-range 0.10:0.30 --sl-range 0.02:0.08
 ```
+
+**Strategy metrics** (JSON output includes per-combo diagnostics):
+- `sharpe` — risk-adjusted return ratio
+- `avg_return`, `win_rate` — basic return statistics
+- `avg_win`, `avg_loss` — average winning/losing trade return
+- `expectancy` — expected return per trade: `(win_rate × avg_win) + (loss_rate × avg_loss)`
+- `max_drawdown` — peak-to-trough drawdown across sequential trades
+- `exposure_pct` — fraction of trades that hit TP/SL (vs timing out)
+- `total_trades` — number of trades evaluated
 
 ### 6. `stockctl cache` — Manage Disk Cache
 

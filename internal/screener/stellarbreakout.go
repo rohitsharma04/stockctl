@@ -13,10 +13,11 @@ import (
 // StellarBreakout screens for volume-confirmed breakouts with Heikin-Ashi
 // trend confirmation and bull consolidation patterns.
 type StellarBreakout struct {
-	cfg config.ScreenerConfig
+	cfg     config.ScreenerConfig
+	scoring config.ScoringConfig
 }
 
-func NewStellarBreakout(cfg config.ScreenerConfig) *StellarBreakout {
+func NewStellarBreakout(cfg config.ScreenerConfig, scoring config.ScoringConfig) *StellarBreakout {
 	if cfg.FibonacciLevel == 0 {
 		cfg.FibonacciLevel = 0.618
 	}
@@ -35,7 +36,7 @@ func NewStellarBreakout(cfg config.ScreenerConfig) *StellarBreakout {
 	if cfg.MinDataDays == 0 {
 		cfg.MinDataDays = 756
 	}
-	return &StellarBreakout{cfg: cfg}
+	return &StellarBreakout{cfg: cfg, scoring: scoring}
 }
 
 func (s *StellarBreakout) Name() string        { return "stellar-breakout" }
@@ -44,7 +45,7 @@ func (s *StellarBreakout) Description() string  { return "Volume explosion + Hei
 func (s *StellarBreakout) Screen(_ context.Context, data []marketdata.OHLCV, _ []marketdata.OHLCV) (*ScreenResult, error) {
 	if len(data) < s.cfg.MinDataDays {
 		return &ScreenResult{Pass: false, Score: 0, Filters: []FilterResult{
-			{Name: "min_data", Pass: false, Value: float64(len(data)), Threshold: float64(s.cfg.MinDataDays)},
+			MakeFilter("min_data", false, float64(len(data)), float64(s.cfg.MinDataDays), ImportanceMinor, "insufficient data"),
 		}}, nil
 	}
 
@@ -55,57 +56,57 @@ func (s *StellarBreakout) Screen(_ context.Context, data []marketdata.OHLCV, _ [
 	n := len(closes)
 	var filters []FilterResult
 
-	// 1. Min price
-	filters = append(filters, FilterResult{
-		Name: "min_price", Pass: closes[n-1] > 5.0, Value: closes[n-1], Threshold: 5.0,
-	})
+	// 1. Min price (minor)
+	filters = append(filters, MakeFilter(
+		"min_price", closes[n-1] > 5.0, closes[n-1], 5.0, ImportanceMinor, "",
+	))
 
 	// Resample to weekly
 	weekly := marketdata.ToWeekly(data)
 	wn := len(weekly)
 	if wn < 55 {
 		return &ScreenResult{Pass: false, Score: 0, Filters: []FilterResult{
-			{Name: "min_weekly_data", Pass: false, Value: float64(wn), Threshold: 55},
+			MakeFilter("min_weekly_data", false, float64(wn), 55, ImportanceMinor, "insufficient weekly data"),
 		}}, nil
 	}
 
-	// 2. Volume explosion: recent 5-week max > 50% of 3-year max (excl last 3 weeks)
+	// 2. Volume explosion (critical)
 	volExpPass, volExpRatio := s.checkVolumeCondition(weekly)
-	filters = append(filters, FilterResult{
-		Name: "volume_explosion", Pass: volExpPass, Value: volExpRatio, Threshold: s.cfg.VolumeExplosionRatio,
-		Detail: fmt.Sprintf("recent/historical ratio %.2f vs %.2f required", volExpRatio, s.cfg.VolumeExplosionRatio),
-	})
+	filters = append(filters, MakeFilter(
+		"volume_explosion", volExpPass, volExpRatio, s.cfg.VolumeExplosionRatio, ImportanceCritical,
+		fmt.Sprintf("recent/historical ratio %.2f vs %.2f required", volExpRatio, s.cfg.VolumeExplosionRatio),
+	))
 
-	// 3. Fibonacci proximity: close 2 weeks ago > 61.8% of 52-week high
+	// 3. Fibonacci proximity (major)
 	fibPass, fibRatio := s.checkCloseCondition(weekly)
-	filters = append(filters, FilterResult{
-		Name: "fibonacci_proximity", Pass: fibPass, Value: fibRatio, Threshold: s.cfg.FibonacciLevel,
-		Detail: fmt.Sprintf("close ratio %.2f vs %.2f threshold", fibRatio, s.cfg.FibonacciLevel),
-	})
+	filters = append(filters, MakeFilter(
+		"fibonacci_proximity", fibPass, fibRatio, s.cfg.FibonacciLevel, ImportanceMajor,
+		fmt.Sprintf("close ratio %.2f vs %.2f threshold", fibRatio, s.cfg.FibonacciLevel),
+	))
 
-	// 4. Bull consolidation: up week → down week (lower volume, close holds)
+	// 4. Bull consolidation (major)
 	consPass := s.checkConsolidation(weekly)
-	filters = append(filters, FilterResult{
-		Name: "bull_consolidation", Pass: consPass, Value: 1, Threshold: 1,
-		Detail: "up week → down week with lower volume and held close",
-	})
+	filters = append(filters, MakeFilter(
+		"bull_consolidation", consPass, 1, 1, ImportanceMajor,
+		"up week → down week with lower volume and held close",
+	))
 
-	// 5. Heikin-Ashi bullish: HA Close >= HA Open today
+	// 5. Heikin-Ashi bullish (critical)
 	haOpen, haClose := indicators.HeikinAshi(opens, highs, lows, closes)
 	haPass := haClose[n-1] >= haOpen[n-1]
-	filters = append(filters, FilterResult{
-		Name: "heikinashi_bullish", Pass: haPass, Value: haClose[n-1], Threshold: haOpen[n-1],
-		Detail: fmt.Sprintf("HA close=%.2f vs HA open=%.2f", haClose[n-1], haOpen[n-1]),
-	})
+	filters = append(filters, MakeFilter(
+		"heikinashi_bullish", haPass, haClose[n-1], haOpen[n-1], ImportanceCritical,
+		fmt.Sprintf("HA close=%.2f vs HA open=%.2f", haClose[n-1], haOpen[n-1]),
+	))
 
-	// 6. Volume significance: 5-week avg >= 30% of historical max
+	// 6. Volume significance (major)
 	sigPass, sigRatio := s.checkRecentVolumeSignificance(weekly)
-	filters = append(filters, FilterResult{
-		Name: "volume_significance", Pass: sigPass, Value: sigRatio, Threshold: s.cfg.VolumeSignificance,
-		Detail: fmt.Sprintf("avg/max ratio %.2f vs %.2f required", sigRatio, s.cfg.VolumeSignificance),
-	})
+	filters = append(filters, MakeFilter(
+		"volume_significance", sigPass, sigRatio, s.cfg.VolumeSignificance, ImportanceMajor,
+		fmt.Sprintf("avg/max ratio %.2f vs %.2f required", sigRatio, s.cfg.VolumeSignificance),
+	))
 
-	return NewScreenResult(filters), nil
+	return NewScreenResultWeighted(filters, s.scoring), nil
 }
 
 func (s *StellarBreakout) checkVolumeCondition(weekly []marketdata.WeeklyBar) (bool, float64) {

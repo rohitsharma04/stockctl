@@ -36,10 +36,18 @@ func generateSyntheticOHLCV(days int, base, pctPerDay float64) []marketdata.OHLC
 	return data
 }
 
+func defaultScoringConfig() config.ScoringConfig {
+	return config.ScoringConfig{
+		CriticalWeight: 3.0,
+		MajorWeight:    2.0,
+		MinorWeight:    1.0,
+	}
+}
+
 func TestBreakoutCautionReturnsScreenResult(t *testing.T) {
 	data := generateSyntheticOHLCV(300, 10.0, 0.002) // uptrending
 	cfg := config.ScreenerConfig{}
-	scr := NewBreakoutCaution(cfg)
+	scr := NewBreakoutCaution(cfg, defaultScoringConfig())
 
 	result, err := scr.Screen(context.Background(), data, nil)
 	if err != nil {
@@ -78,7 +86,7 @@ func TestBreakoutCautionReturnsScreenResult(t *testing.T) {
 func TestHighPerformanceReturnsScreenResult(t *testing.T) {
 	data := generateSyntheticOHLCV(800, 10.0, 0.001)
 	cfg := config.ScreenerConfig{}
-	scr := NewHighPerformance(cfg)
+	scr := NewHighPerformance(cfg, defaultScoringConfig())
 
 	result, err := scr.Screen(context.Background(), data, nil)
 	if err != nil {
@@ -111,7 +119,7 @@ func TestHighPerformanceReturnsScreenResult(t *testing.T) {
 func TestStellarBreakoutReturnsScreenResult(t *testing.T) {
 	data := generateSyntheticOHLCV(800, 10.0, 0.001)
 	cfg := config.ScreenerConfig{}
-	scr := NewStellarBreakout(cfg)
+	scr := NewStellarBreakout(cfg, defaultScoringConfig())
 
 	result, err := scr.Screen(context.Background(), data, nil)
 	if err != nil {
@@ -128,7 +136,7 @@ func TestStellarBreakoutReturnsScreenResult(t *testing.T) {
 func TestDescendingBreakoutReturnsScreenResult(t *testing.T) {
 	data := generateSyntheticOHLCV(800, 50.0, -0.0005) // downtrending
 	cfg := config.ScreenerConfig{}
-	scr := NewDescendingBreakout(cfg)
+	scr := NewDescendingBreakout(cfg, defaultScoringConfig())
 
 	result, err := scr.Screen(context.Background(), data, nil)
 	if err != nil {
@@ -146,7 +154,7 @@ func TestInsufficientData(t *testing.T) {
 	data := generateSyntheticOHLCV(50, 10.0, 0.001) // too few
 	cfg := config.ScreenerConfig{}
 
-	scr := NewBreakoutCaution(cfg)
+	scr := NewBreakoutCaution(cfg, defaultScoringConfig())
 	result, err := scr.Screen(context.Background(), data, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -158,7 +166,9 @@ func TestInsufficientData(t *testing.T) {
 
 func TestNewScreenResult(t *testing.T) {
 	filters := []FilterResult{
-		{Name: "a", Pass: true}, {Name: "b", Pass: false}, {Name: "c", Pass: true},
+		{Name: "a", Pass: true, Status: StatusPass, Importance: ImportanceMajor},
+		{Name: "b", Pass: false, Status: StatusFail, Importance: ImportanceMajor},
+		{Name: "c", Pass: true, Status: StatusPass, Importance: ImportanceMajor},
 	}
 	result := NewScreenResult(filters)
 
@@ -170,5 +180,125 @@ func TestNewScreenResult(t *testing.T) {
 	}
 	if len(result.Filters) != 3 {
 		t.Errorf("expected 3 filters, got %d", len(result.Filters))
+	}
+}
+
+// --- New tests for tri-state scoring ---
+
+func TestNewScreenResult_WithUnknowns(t *testing.T) {
+	filters := []FilterResult{
+		{Name: "a", Pass: true, Status: StatusPass, Importance: ImportanceCritical},
+		{Name: "b", Pass: false, Status: StatusUnknown, Importance: ImportanceMajor},
+		{Name: "c", Pass: true, Status: StatusPass, Importance: ImportanceMinor},
+	}
+	result := NewScreenResult(filters)
+
+	if result.Pass {
+		t.Error("should not pass when unknowns are present")
+	}
+	// Score: 2 pass / 3 total = 0.667 (unknowns don't count as pass)
+	if result.Score < 0.66 || result.Score > 0.67 {
+		t.Errorf("score should be ~0.667, got %f", result.Score)
+	}
+	// DataConfidence: 2 valid / 3 total = 0.667
+	if result.DataConfidence < 0.66 || result.DataConfidence > 0.67 {
+		t.Errorf("data_confidence should be ~0.667, got %f", result.DataConfidence)
+	}
+	// Unknown filter's Pass should be forced to false
+	for _, f := range result.Filters {
+		if f.Status == StatusUnknown && f.Pass {
+			t.Errorf("filter %q has status=unknown but pass=true", f.Name)
+		}
+	}
+}
+
+func TestNewScreenResult_WeightedScoring(t *testing.T) {
+	// critical (3x) passes, major (2x) fails, minor (1x) passes
+	// weighted = (3 + 1) / (3 + 2 + 1) = 4/6 = 0.667
+	filters := []FilterResult{
+		{Name: "a", Pass: true, Status: StatusPass, Importance: ImportanceCritical},
+		{Name: "b", Pass: false, Status: StatusFail, Importance: ImportanceMajor},
+		{Name: "c", Pass: true, Status: StatusPass, Importance: ImportanceMinor},
+	}
+	result := NewScreenResult(filters)
+
+	if result.WeightedScore < 0.66 || result.WeightedScore > 0.67 {
+		t.Errorf("weighted_score should be ~0.667 (4/6), got %f", result.WeightedScore)
+	}
+}
+
+func TestDataConfidence_AllValid(t *testing.T) {
+	filters := []FilterResult{
+		{Name: "a", Pass: true, Status: StatusPass, Importance: ImportanceCritical},
+		{Name: "b", Pass: false, Status: StatusFail, Importance: ImportanceMajor},
+	}
+	result := NewScreenResult(filters)
+
+	if result.DataConfidence != 1.0 {
+		t.Errorf("data_confidence should be 1.0 when no unknowns, got %f", result.DataConfidence)
+	}
+}
+
+func TestDataConfidence_WithMissing(t *testing.T) {
+	filters := []FilterResult{
+		{Name: "a", Pass: true, Status: StatusPass, Importance: ImportanceCritical},
+		{Name: "b", Pass: false, Status: StatusUnknown, Importance: ImportanceMajor},
+		{Name: "c", Pass: false, Status: StatusUnknown, Importance: ImportanceMinor},
+		{Name: "d", Pass: true, Status: StatusPass, Importance: ImportanceMajor},
+	}
+	result := NewScreenResult(filters)
+
+	// 2 unknowns out of 4 = confidence 0.5
+	if result.DataConfidence != 0.5 {
+		t.Errorf("data_confidence should be 0.5, got %f", result.DataConfidence)
+	}
+}
+
+func TestBreakoutCaution_NoBenchmark_RSUnknown(t *testing.T) {
+	data := generateSyntheticOHLCV(300, 10.0, 0.002)
+	cfg := config.ScreenerConfig{}
+	scr := NewBreakoutCaution(cfg, defaultScoringConfig())
+
+	// Pass nil benchmark — RS should be unknown, not pass
+	result, err := scr.Screen(context.Background(), data, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for _, f := range result.Filters {
+		if f.Name == "relative_strength" {
+			if f.Status != StatusUnknown {
+				t.Errorf("relative_strength should be status=%q when no benchmark, got %q", StatusUnknown, f.Status)
+			}
+			if f.Pass {
+				t.Error("relative_strength should NOT pass when no benchmark")
+			}
+			return
+		}
+	}
+	t.Error("relative_strength filter not found in results")
+}
+
+func TestActionabilityScore(t *testing.T) {
+	// All pass, all known → actionability = 1.0
+	filters := []FilterResult{
+		{Name: "a", Pass: true, Status: StatusPass, Importance: ImportanceCritical},
+		{Name: "b", Pass: true, Status: StatusPass, Importance: ImportanceMajor},
+	}
+	result := NewScreenResult(filters)
+
+	if result.ActionabilityScore != 1.0 {
+		t.Errorf("actionability should be 1.0 when all pass and known, got %f", result.ActionabilityScore)
+	}
+
+	// One unknown → actionability < 1.0
+	filters2 := []FilterResult{
+		{Name: "a", Pass: true, Status: StatusPass, Importance: ImportanceCritical},
+		{Name: "b", Pass: false, Status: StatusUnknown, Importance: ImportanceMajor},
+	}
+	result2 := NewScreenResult(filters2)
+
+	if result2.ActionabilityScore >= 1.0 {
+		t.Errorf("actionability should be < 1.0 with unknowns, got %f", result2.ActionabilityScore)
 	}
 }

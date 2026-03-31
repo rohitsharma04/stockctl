@@ -13,6 +13,14 @@ type Config struct {
 	Screeners map[string]ScreenerConfig  `toml:"screeners"`
 	Pairs     PairsConfig                `toml:"pairs"`
 	Backtest  BacktestConfig             `toml:"backtest"`
+	Scoring   ScoringConfig              `toml:"scoring"`
+}
+
+// ScoringConfig controls how filter importance levels are weighted.
+type ScoringConfig struct {
+	CriticalWeight float64 `toml:"critical_weight"`
+	MajorWeight    float64 `toml:"major_weight"`
+	MinorWeight    float64 `toml:"minor_weight"`
 }
 
 type GeneralConfig struct {
@@ -193,6 +201,17 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Backtest.MinRewardRisk == 0 {
 		cfg.Backtest.MinRewardRisk = 3.0
+	}
+
+	// Scoring
+	if cfg.Scoring.CriticalWeight == 0 {
+		cfg.Scoring.CriticalWeight = 3.0
+	}
+	if cfg.Scoring.MajorWeight == 0 {
+		cfg.Scoring.MajorWeight = 2.0
+	}
+	if cfg.Scoring.MinorWeight == 0 {
+		cfg.Scoring.MinorWeight = 1.0
 	}
 }
 
