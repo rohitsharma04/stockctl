@@ -66,8 +66,10 @@ func newSeedHistoryCmd() *cobra.Command {
 	var stateFile, deadline string
 	var rate, workers, maxAttempts int
 	cmd := &cobra.Command{
-		Use:   "history",
-		Short: "Seed five years of daily history into the local cache",
+		Use:           "history",
+		Short:         "Seed five years of daily history into the local cache",
+		SilenceUsage:  true,
+		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(markets) == 0 {
 				return errors.New("at least one --market (india or us) is required")
@@ -121,7 +123,11 @@ func newSeedHistoryCmd() *cobra.Command {
 			}
 			provider := seedProviderFactory(noCache, rate)
 			summary := seedSummary{Started: now, Markets: markets, Total: len(tickers)}
+			interrupted := false
 			for _, ticker := range tickers {
+				if interrupted {
+					break
+				}
 				st := checkpoint.Tickers[ticker]
 				if st.Status == "success" || st.Status == "failed" {
 					continue
@@ -131,10 +137,11 @@ func newSeedHistoryCmd() *cobra.Command {
 				}
 				for {
 					if err := ctx.Err(); err != nil {
-						markSeedFailure(st, err)
+						markSeedPending(st, err)
 						if err := saveSeedCheckpoint(stateFile, checkpoint); err != nil {
 							return err
 						}
+						interrupted = true
 						break
 					}
 					st.Attempts++
@@ -148,7 +155,15 @@ func newSeedHistoryCmd() *cobra.Command {
 						}
 						break
 					}
-					if ctx.Err() != nil || !isTransientSeedError(err) || st.Attempts >= maxAttempts {
+					if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						markSeedPending(st, err)
+						if err := saveSeedCheckpoint(stateFile, checkpoint); err != nil {
+							return err
+						}
+						interrupted = true
+						break
+					}
+					if !isTransientSeedError(err) || st.Attempts >= maxAttempts {
 						markSeedFailure(st, err)
 						if err := saveSeedCheckpoint(stateFile, checkpoint); err != nil {
 							return err
@@ -164,10 +179,11 @@ func newSeedHistoryCmd() *cobra.Command {
 					}
 					select {
 					case <-ctx.Done():
-						markSeedFailure(st, ctx.Err())
+						markSeedPending(st, ctx.Err())
 						if err := saveSeedCheckpoint(stateFile, checkpoint); err != nil {
 							return err
 						}
+						interrupted = true
 					case <-time.After(delay):
 						continue
 					}
@@ -297,6 +313,9 @@ func saveSeedCheckpoint(path string, state *seedCheckpoint) error {
 
 func markSeedFailure(st *seedTickerState, err error) {
 	st.Status, st.LastError, st.NextRetry, st.UpdatedAt = "failed", err.Error(), time.Time{}, time.Now().UTC()
+}
+func markSeedPending(st *seedTickerState, err error) {
+	st.Status, st.LastError, st.NextRetry, st.UpdatedAt = "pending", err.Error(), time.Time{}, time.Now().UTC()
 }
 func seedJitter(attempt int) time.Duration {
 	cap := 2 * time.Second
