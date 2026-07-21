@@ -18,6 +18,9 @@ type BreakoutCaution struct {
 }
 
 func NewBreakoutCaution(cfg config.ScreenerConfig, scoring config.ScoringConfig) *BreakoutCaution {
+	if cfg.MinPrice == 0 {
+		cfg.MinPrice = 5.0
+	}
 	if cfg.BollingerPeriod == 0 {
 		cfg.BollingerPeriod = 20
 	}
@@ -45,8 +48,10 @@ func NewBreakoutCaution(cfg config.ScreenerConfig, scoring config.ScoringConfig)
 	return &BreakoutCaution{cfg: cfg, scoring: scoring}
 }
 
-func (b *BreakoutCaution) Name() string        { return "breakout-caution" }
-func (b *BreakoutCaution) Description() string  { return "Bollinger Band breakout + volume + relative strength" }
+func (b *BreakoutCaution) Name() string { return "breakout-caution" }
+func (b *BreakoutCaution) Description() string {
+	return "Bollinger Band breakout + volume + relative strength"
+}
 
 func (b *BreakoutCaution) Screen(_ context.Context, data []marketdata.OHLCV, benchmark []marketdata.OHLCV) (*ScreenResult, error) {
 	var filters []FilterResult
@@ -67,8 +72,8 @@ func (b *BreakoutCaution) Screen(_ context.Context, data []marketdata.OHLCV, ben
 	// 1. Min price (minor)
 	price := closes[n-1]
 	filters = append(filters, MakeFilter(
-		"min_price", price > 5.0, price, 5.0, ImportanceMinor,
-		fmt.Sprintf("$%.2f", price),
+		"min_price", price >= b.cfg.MinPrice, price, b.cfg.MinPrice, ImportanceMinor,
+		fmt.Sprintf("%.2f", price),
 	))
 
 	// 2. Momentum: 10% rise in last month (major)

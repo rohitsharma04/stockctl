@@ -15,6 +15,9 @@ type DescendingBreakout struct {
 }
 
 func NewDescendingBreakout(cfg config.ScreenerConfig, scoring config.ScoringConfig) *DescendingBreakout {
+	if cfg.MinPrice == 0 {
+		cfg.MinPrice = 5.0
+	}
 	if cfg.Months == 0 {
 		cfg.Months = 36
 	}
@@ -30,8 +33,10 @@ func NewDescendingBreakout(cfg config.ScreenerConfig, scoring config.ScoringConf
 	return &DescendingBreakout{cfg: cfg, scoring: scoring}
 }
 
-func (d *DescendingBreakout) Name() string        { return "descending-breakout" }
-func (d *DescendingBreakout) Description() string  { return "Descending triangle breakout with volume confirmation" }
+func (d *DescendingBreakout) Name() string { return "descending-breakout" }
+func (d *DescendingBreakout) Description() string {
+	return "Descending triangle breakout with volume confirmation"
+}
 
 func (d *DescendingBreakout) Screen(_ context.Context, data []marketdata.OHLCV, _ []marketdata.OHLCV) (*ScreenResult, error) {
 	if len(data) < d.cfg.MinDataDays {
@@ -46,7 +51,7 @@ func (d *DescendingBreakout) Screen(_ context.Context, data []marketdata.OHLCV, 
 
 	// 1. Min price (minor)
 	filters = append(filters, MakeFilter(
-		"min_price", closes[n-1] > 5.0, closes[n-1], 5.0, ImportanceMinor, "",
+		"min_price", closes[n-1] >= d.cfg.MinPrice, closes[n-1], d.cfg.MinPrice, ImportanceMinor, "",
 	))
 
 	// Resample to monthly

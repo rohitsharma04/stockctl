@@ -187,15 +187,19 @@ func Registry(cfg *config.Config) map[string]Screener {
 	screeners := make(map[string]Screener)
 
 	bcCfg := cfg.Screeners["breakout_caution"]
+	bcCfg.MinPrice = cfg.General.MinPrice
 	screeners["breakout-caution"] = NewBreakoutCaution(bcCfg, cfg.Scoring)
 
 	hpCfg := cfg.Screeners["high_performance"]
+	hpCfg.MinPrice = cfg.General.MinPrice
 	screeners["high-performance"] = NewHighPerformance(hpCfg, cfg.Scoring)
 
 	sbCfg := cfg.Screeners["stellar_breakout"]
+	sbCfg.MinPrice = cfg.General.MinPrice
 	screeners["stellar-breakout"] = NewStellarBreakout(sbCfg, cfg.Scoring)
 
 	dbCfg := cfg.Screeners["descending_breakout"]
+	dbCfg.MinPrice = cfg.General.MinPrice
 	screeners["descending-breakout"] = NewDescendingBreakout(dbCfg, cfg.Scoring)
 
 	screeners["rsi-bounce"] = NewRSIBounce(cfg.Scoring)

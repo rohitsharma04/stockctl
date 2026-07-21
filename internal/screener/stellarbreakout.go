@@ -18,6 +18,9 @@ type StellarBreakout struct {
 }
 
 func NewStellarBreakout(cfg config.ScreenerConfig, scoring config.ScoringConfig) *StellarBreakout {
+	if cfg.MinPrice == 0 {
+		cfg.MinPrice = 5.0
+	}
 	if cfg.FibonacciLevel == 0 {
 		cfg.FibonacciLevel = 0.618
 	}
@@ -40,7 +43,7 @@ func NewStellarBreakout(cfg config.ScreenerConfig, scoring config.ScoringConfig)
 }
 
 func (s *StellarBreakout) Name() string        { return "stellar-breakout" }
-func (s *StellarBreakout) Description() string  { return "Volume explosion + Heikin-Ashi confirmation" }
+func (s *StellarBreakout) Description() string { return "Volume explosion + Heikin-Ashi confirmation" }
 
 func (s *StellarBreakout) Screen(_ context.Context, data []marketdata.OHLCV, _ []marketdata.OHLCV) (*ScreenResult, error) {
 	if len(data) < s.cfg.MinDataDays {
@@ -58,7 +61,7 @@ func (s *StellarBreakout) Screen(_ context.Context, data []marketdata.OHLCV, _ [
 
 	// 1. Min price (minor)
 	filters = append(filters, MakeFilter(
-		"min_price", closes[n-1] > 5.0, closes[n-1], 5.0, ImportanceMinor, "",
+		"min_price", closes[n-1] >= s.cfg.MinPrice, closes[n-1], s.cfg.MinPrice, ImportanceMinor, "",
 	))
 
 	// Resample to weekly

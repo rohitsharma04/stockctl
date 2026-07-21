@@ -171,6 +171,11 @@ func runScan(cmd *cobra.Command, args []string) error {
 	provider := marketdata.BuildProvider(noCache)
 
 	logf("🌍 Market: %s (%s)\n", activeMarket.Name, activeMarket.Currency)
+	effectivePriceFloor := effectiveMinPrice(minPrice, appConfig.General.MinPrice, activeMarket.MinPrice)
+	// Keep strategy-level min-price filters aligned with the effective policy:
+	// CLI override, then an explicit config value, then the active-market default.
+	appConfig.General.MinPrice = effectivePriceFloor
+	logf("📏 Min price: %s%.2f\n", activeMarket.CurrencySymbol, effectivePriceFloor)
 
 	// Get registry
 	registry := screener.Registry(appConfig)
@@ -238,6 +243,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 	}
 
 	snapshot, scanWarnings := fetchScanSnapshot(ctx, tickers, provider, activeMarket.Benchmark, w, asOfDate)
+	snapshot.applyPriceFloor(effectivePriceFloor)
 
 	// Run screening
 	if appConfig.General.Output == "csv" {
@@ -248,8 +254,6 @@ func runScan(cmd *cobra.Command, args []string) error {
 	allErrors := append([]output.ErrorInfo(nil), snapshot.errors...)
 	breadthData := append([]screener.TickerBreadthData(nil), snapshot.breadthData...)
 	totalScanned := len(tickers)
-	tickersComplete := 0
-	tickersPartial := 0
 
 	for _, scr := range screeners {
 		logf("\n🔍 Running %s screener on %d tickers (workers: %d)...\n", scr.Name(), len(tickers), w)
@@ -264,16 +268,6 @@ func runScan(cmd *cobra.Command, args []string) error {
 
 		if len(results) > 0 && appConfig.General.Output != "json" {
 			renderResults(scr.Name(), results, appConfig.General.Output)
-		}
-	}
-
-	// Count data health categories
-	for _, r := range allResults {
-		switch r.DataHealth {
-		case "complete":
-			tickersComplete++
-		case "partial", "degraded":
-			tickersPartial++
 		}
 	}
 
@@ -328,19 +322,22 @@ func runScan(cmd *cobra.Command, args []string) error {
 		meta := output.NewMeta("scan")
 		meta.Market = activeMarket.ID
 		meta.Strategy = strategy
+		meta.Currency = activeMarket.Currency
+		meta.CurrencySymbol = activeMarket.CurrencySymbol
 		if !asOfDate.IsZero() {
 			meta.AsOfDate = asOfDate.Format("2006-01-02")
 		}
+		quality := snapshot.dataQualitySummary()
+		quality.BenchmarkAvailable = snapshot.benchmarkAvailable
+		quality.BenchmarkSymbol = activeMarket.Benchmark
+		quality.BenchmarkBars = len(snapshot.benchmarkData)
 		meta.TickersScanned = totalScanned
-		meta.TickersFailed = len(allErrors)
+		meta.TickersFailed = quality.TickersFailed
 		meta.DurationMs = time.Since(startTime).Milliseconds()
-		meta.DataQuality = &output.DataQualitySummary{
-			BenchmarkAvailable: snapshot.benchmarkAvailable,
-			BenchmarkSymbol:    activeMarket.Benchmark,
-			BenchmarkBars:      len(snapshot.benchmarkData),
-			TickersComplete:    tickersComplete,
-			TickersPartial:     tickersPartial,
-			TickersFailed:      len(allErrors),
+		meta.DataQuality = &quality
+		meta.EffectivePolicy = &output.EffectivePolicy{
+			MinPrice:       effectivePriceFloor,
+			MinTradedValue: minTradedValue,
 		}
 
 		envResults := scanEnvelope{
@@ -370,19 +367,24 @@ type tickerScanData struct {
 }
 
 type scanSnapshot struct {
-	benchmarkData      []marketdata.OHLCV
-	benchmarkAvailable bool
-	tickerData         map[string][]marketdata.OHLCV
-	breadthData        []screener.TickerBreadthData
-	errors             []output.ErrorInfo
+	benchmarkData       []marketdata.OHLCV
+	benchmarkAvailable  bool
+	benchmarkProvenance marketdata.HistoryProvenance
+	tickerData          map[string][]marketdata.OHLCV
+	tickerProvenance    map[string]marketdata.HistoryProvenance
+	excludedByPolicy    map[string]string
+	breadthData         []screener.TickerBreadthData
+	errors              []output.ErrorInfo
+	upstreamFailures    int
 }
 
 type fetchedTickerData struct {
-	index   int
-	ticker  string
-	data    []marketdata.OHLCV
-	breadth screener.TickerBreadthData
-	err     error
+	index      int
+	ticker     string
+	data       []marketdata.OHLCV
+	breadth    screener.TickerBreadthData
+	provenance marketdata.HistoryProvenance
+	err        error
 }
 
 type tickerScoreUpdate struct {
@@ -391,15 +393,152 @@ type tickerScoreUpdate struct {
 	fullPass bool
 }
 
+func effectiveMinPrice(override, configured, marketDefault float64) float64 {
+	if override > 0 {
+		return override
+	}
+	if configured > 0 {
+		return configured
+	}
+	return marketDefault
+}
+
+func meetsMinPrice(data []marketdata.OHLCV, floor float64) bool {
+	close, ok := latestValidClose(data)
+	return ok && close >= floor
+}
+
+// latestValidClose returns the most recent finite, positive close. It is kept
+// pure so policy behavior is deterministic for missing and malformed bars.
+func latestValidClose(data []marketdata.OHLCV) (float64, bool) {
+	for i := len(data) - 1; i >= 0; i-- {
+		close := data[i].Close
+		if close > 0 && !math.IsNaN(close) && !math.IsInf(close, 0) {
+			return close, true
+		}
+	}
+	return 0, false
+}
+
+func getHistoryResult(ctx context.Context, provider marketdata.Provider, req marketdata.HistoryRequest) (*marketdata.HistoryResult, error) {
+	if hp, ok := provider.(marketdata.HistoryProvider); ok {
+		return hp.GetHistoryWithProvenance(ctx, req)
+	}
+	data, err := provider.GetHistory(ctx, req.Symbol, req.Period, req.Interval)
+	if err != nil {
+		return nil, err
+	}
+	provenance := marketdata.HistoryProvenance{Source: marketdata.HistorySourceUpstream}
+	if len(data) > 0 {
+		provenance.LastBarDate = data[len(data)-1].Date
+	}
+	return &marketdata.HistoryResult{Data: data, Provenance: provenance}, nil
+}
+
+func provenanceWithLastBar(provenance marketdata.HistoryProvenance, data []marketdata.OHLCV) marketdata.HistoryProvenance {
+	if len(data) > 0 {
+		provenance.LastBarDate = data[len(data)-1].Date
+	}
+	return provenance
+}
+
+func (s *scanSnapshot) applyPriceFloor(floor float64) {
+	if s.excludedByPolicy == nil {
+		s.excludedByPolicy = make(map[string]string)
+	}
+	for ticker, data := range s.tickerData {
+		if !meetsMinPrice(data, floor) {
+			s.excludedByPolicy[ticker] = "below_min_price"
+		}
+	}
+}
+
+func (s scanSnapshot) dataQualitySummary() output.DataQualitySummary {
+	quality := output.DataQualitySummary{
+		BenchmarkAvailable: s.benchmarkAvailable,
+		BenchmarkBars:      len(s.benchmarkData),
+		TickersFailed:      len(s.errors),
+		UpstreamFailures:   s.upstreamFailures,
+		SourceCounts:       make(map[string]int),
+		AgeDistribution:    make(map[string]int),
+	}
+	var latestBar time.Time
+	var fetchedAt time.Time
+	now := time.Now()
+	for ticker, data := range s.tickerData {
+		provenance := s.tickerProvenance[ticker]
+		source := string(provenance.Source)
+		if source == "" {
+			source = string(marketdata.HistorySourceUpstream)
+		}
+		quality.SourceCounts[source]++
+		if provenance.Source == marketdata.HistorySourceCache {
+			quality.CacheOnlyTickers++
+		}
+		if provenance.Source == marketdata.HistorySourceCacheAndUpstream {
+			quality.DeltaRefreshedTickers++
+		}
+		_, usable := latestValidClose(data)
+		if provenance.Stale || !usable {
+			quality.TickersPartial++
+			if provenance.Stale {
+				quality.TickersStaleFallback++
+			}
+		} else {
+			quality.TickersComplete++
+		}
+		if provenance.LastBarDate.After(latestBar) {
+			latestBar = provenance.LastBarDate
+		}
+		if provenance.FetchedAt.After(fetchedAt) {
+			fetchedAt = provenance.FetchedAt
+		}
+		lastBar := provenance.LastBarDate
+		if lastBar.IsZero() && len(data) > 0 {
+			lastBar = data[len(data)-1].Date
+		}
+		if !lastBar.IsZero() {
+			ageDays := int(now.Sub(lastBar).Hours() / 24)
+			switch {
+			case ageDays <= 1:
+				quality.AgeDistribution["0-1d"]++
+			case ageDays <= 3:
+				quality.AgeDistribution["2-3d"]++
+			case ageDays <= 7:
+				quality.AgeDistribution["4-7d"]++
+			default:
+				quality.AgeDistribution["gt_7d"]++
+			}
+		}
+	}
+	if !latestBar.IsZero() {
+		quality.DataAsOf = latestBar.Format("2006-01-02")
+	}
+	if !fetchedAt.IsZero() {
+		quality.ProviderFetchedAt = fetchedAt.UTC().Format(time.RFC3339)
+	}
+	if len(quality.SourceCounts) == 0 {
+		quality.SourceCounts = nil
+	}
+	if len(quality.AgeDistribution) == 0 {
+		quality.AgeDistribution = nil
+	}
+	return quality
+}
+
 func fetchScanSnapshot(ctx context.Context, tickers []string, provider marketdata.Provider, benchmarkSymbol string, workers int, asOfDate time.Time) (scanSnapshot, []output.Warning) {
 	snapshot := scanSnapshot{
-		tickerData: make(map[string][]marketdata.OHLCV, len(tickers)),
+		tickerData:       make(map[string][]marketdata.OHLCV, len(tickers)),
+		tickerProvenance: make(map[string]marketdata.HistoryProvenance, len(tickers)),
+		excludedByPolicy: make(map[string]string),
 	}
 	var warnings []output.Warning
 
 	if benchmarkSymbol != "" {
 		logf("📊 Fetching benchmark data (%s)...\n", benchmarkSymbol)
-		benchmarkData, err := provider.GetHistory(ctx, benchmarkSymbol, "5y", "1d")
+		benchmarkResult, err := getHistoryResult(ctx, provider, marketdata.HistoryRequest{
+			Symbol: benchmarkSymbol, Period: "5y", Interval: "1d", AsOf: asOfDate,
+		})
 		if err != nil {
 			logf("⚠️  Could not fetch benchmark: %v (relative strength checks will be skipped)\n", err)
 			warnings = append(warnings, output.Warning{
@@ -407,30 +546,34 @@ func fetchScanSnapshot(ctx context.Context, tickers []string, provider marketdat
 				Message: fmt.Sprintf("Could not fetch benchmark %s: %v", benchmarkSymbol, err),
 			})
 		} else if !asOfDate.IsZero() {
-			benchmarkData, err = marketdata.TruncateAt(benchmarkData, asOfDate)
+			benchmarkResult.Data, err = marketdata.TruncateAt(benchmarkResult.Data, asOfDate)
 			if err != nil {
 				logf("⚠️  Could not truncate benchmark to %s: %v\n", asOfDate.Format("2006-01-02"), err)
 				warnings = append(warnings, output.Warning{
 					Code:    "benchmark_truncation_failed",
 					Message: fmt.Sprintf("Benchmark truncation to %s failed: %v", asOfDate.Format("2006-01-02"), err),
 				})
-				benchmarkData = nil
+				benchmarkResult = nil
 			}
 		}
-		if benchmarkData != nil {
-			snapshot.benchmarkData = cloneOHLCV(benchmarkData)
+		if benchmarkResult != nil {
+			benchmarkResult.Provenance = provenanceWithLastBar(benchmarkResult.Provenance, benchmarkResult.Data)
+			snapshot.benchmarkData = cloneOHLCV(benchmarkResult.Data)
+			snapshot.benchmarkProvenance = benchmarkResult.Provenance
 			snapshot.benchmarkAvailable = true
 		}
 	}
 
-	tickerData, errors, breadthData := fetchTickerSnapshotData(ctx, tickers, provider, workers, asOfDate)
+	tickerData, provenance, errors, breadthData, upstreamFailures := fetchTickerSnapshotData(ctx, tickers, provider, workers, asOfDate)
 	snapshot.tickerData = tickerData
+	snapshot.tickerProvenance = provenance
 	snapshot.errors = errors
 	snapshot.breadthData = breadthData
+	snapshot.upstreamFailures = upstreamFailures
 	return snapshot, warnings
 }
 
-func fetchTickerSnapshotData(ctx context.Context, tickers []string, provider marketdata.Provider, workers int, asOfDate time.Time) (map[string][]marketdata.OHLCV, []output.ErrorInfo, []screener.TickerBreadthData) {
+func fetchTickerSnapshotData(ctx context.Context, tickers []string, provider marketdata.Provider, workers int, asOfDate time.Time) (map[string][]marketdata.OHLCV, map[string]marketdata.HistoryProvenance, []output.ErrorInfo, []screener.TickerBreadthData, int) {
 	if workers <= 0 {
 		workers = 1
 	}
@@ -446,9 +589,11 @@ func fetchTickerSnapshotData(ctx context.Context, tickers []string, provider mar
 		go func() {
 			defer wg.Done()
 			for j := range jobs {
-				data, err := provider.GetHistory(ctx, j.ticker, "5y", "1d")
+				result, err := getHistoryResult(ctx, provider, marketdata.HistoryRequest{
+					Symbol: j.ticker, Period: "5y", Interval: "1d", AsOf: asOfDate,
+				})
 				if err == nil && !asOfDate.IsZero() {
-					data, err = marketdata.TruncateAt(data, asOfDate)
+					result.Data, err = marketdata.TruncateAt(result.Data, asOfDate)
 				}
 				if err != nil {
 					if verbose {
@@ -456,12 +601,14 @@ func fetchTickerSnapshotData(ctx context.Context, tickers []string, provider mar
 					}
 					results <- fetchedTickerData{index: j.index, ticker: j.ticker, err: err}
 				} else {
-					immutableData := cloneOHLCV(data)
+					result.Provenance = provenanceWithLastBar(result.Provenance, result.Data)
+					immutableData := cloneOHLCV(result.Data)
 					results <- fetchedTickerData{
-						index:   j.index,
-						ticker:  j.ticker,
-						data:    immutableData,
-						breadth: enrichTickerBreadth(j.ticker, computeTickerBreadth(j.ticker, immutableData)),
+						index:      j.index,
+						ticker:     j.ticker,
+						data:       immutableData,
+						provenance: result.Provenance,
+						breadth:    enrichTickerBreadth(j.ticker, computeTickerBreadth(j.ticker, immutableData)),
 					}
 				}
 
@@ -488,8 +635,10 @@ func fetchTickerSnapshotData(ctx context.Context, tickers []string, provider mar
 	}
 
 	tickerData := make(map[string][]marketdata.OHLCV, len(tickers))
+	provenance := make(map[string]marketdata.HistoryProvenance, len(tickers))
 	var errors []output.ErrorInfo
 	var breadthData []screener.TickerBreadthData
+	upstreamFailures := 0
 	for i := range ordered {
 		if !seen[i] {
 			continue
@@ -497,12 +646,17 @@ func fetchTickerSnapshotData(ctx context.Context, tickers []string, provider mar
 		r := ordered[i]
 		if r.err != nil {
 			errors = append(errors, output.ErrorInfo{Ticker: r.ticker, Error: r.err.Error()})
+			upstreamFailures++
 			continue
 		}
 		tickerData[r.ticker] = r.data
+		provenance[r.ticker] = r.provenance
+		if r.provenance.UpstreamError != "" {
+			upstreamFailures++
+		}
 		breadthData = append(breadthData, r.breadth)
 	}
-	return tickerData, errors, breadthData
+	return tickerData, provenance, errors, breadthData, upstreamFailures
 }
 
 func evaluateScanSnapshot(ctx context.Context, snapshot scanSnapshot, screeners []screener.Screener, tickers []string, workers int) ([]scanResult, []output.ErrorInfo, []screener.TickerBreadthData) {
@@ -522,13 +676,16 @@ func runScreenerV2(ctx context.Context, scr screener.Screener, tickers []string,
 	provider marketdata.Provider, benchmark []marketdata.OHLCV, workers int, asOfDate time.Time,
 	benchmarkAvailable bool) ([]scanResult, []output.ErrorInfo, []screener.TickerBreadthData) {
 
-	tickerData, errors, breadthData := fetchTickerSnapshotData(ctx, tickers, provider, workers, asOfDate)
+	tickerData, provenance, errors, breadthData, upstreamFailures := fetchTickerSnapshotData(ctx, tickers, provider, workers, asOfDate)
 	snapshot := scanSnapshot{
 		benchmarkData:      cloneOHLCV(benchmark),
 		benchmarkAvailable: benchmarkAvailable,
 		tickerData:         tickerData,
+		tickerProvenance:   provenance,
+		excludedByPolicy:   make(map[string]string),
 		breadthData:        breadthData,
 		errors:             errors,
+		upstreamFailures:   upstreamFailures,
 	}
 	results, screenErrors, scoreUpdates := runScreenerFromSnapshot(ctx, scr, tickers, snapshot, workers)
 	errors = append(errors, screenErrors...)
@@ -550,7 +707,12 @@ func runScreenerFromSnapshot(ctx context.Context, scr screener.Screener, tickers
 	var scoreUpdates []tickerScoreUpdate
 	var mu sync.Mutex
 	var processed int64
-	total := int64(len(snapshot.tickerData))
+	total := int64(0)
+	for t := range snapshot.tickerData {
+		if _, excluded := snapshot.excludedByPolicy[t]; !excluded {
+			total++
+		}
+	}
 	if total == 0 {
 		return nil, nil, nil
 	}
@@ -602,7 +764,9 @@ func runScreenerFromSnapshot(ctx context.Context, scr screener.Screener, tickers
 
 	for _, t := range tickers {
 		if _, ok := snapshot.tickerData[t]; ok {
-			jobs <- job{ticker: t}
+			if _, excluded := snapshot.excludedByPolicy[t]; !excluded {
+				jobs <- job{ticker: t}
+			}
 		}
 	}
 	close(jobs)

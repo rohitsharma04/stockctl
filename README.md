@@ -90,6 +90,27 @@ The automation stores raw scan JSON and the compact agent input under
 than 400 scanned symbols, or excessive fetch failures; in that case it sends
 nothing rather than publishing a misleading update.
 
+## Resumable weekend history seed
+
+`stockctl seed history` populates and refreshes the local daily-history cache.
+It owns its checkpoint, bounded retry/backoff, rate limit, and resume semantics;
+Hermes should only schedule one long-running process and report a terminal failure.
+
+```bash
+go build -o bin/stockctl .
+bin/stockctl --quiet seed history \
+  --market india --market us \
+  --rate 1 --workers 1 --max-attempts 3 --deadline 6h \
+  --state-file ~/.stockctl/seed-history-state.json
+```
+
+The command is sequential by design (`--workers 1`) to protect Yahoo rate limits.
+It emits a single JSON summary to stdout. A nonzero exit means there are terminal
+failures or work still pending after the deadline; rerun the same command to resume
+without re-fetching successful tickers. See
+[`docs/operations/yahoo-data-runbook.md`](docs/operations/yahoo-data-runbook.md)
+for checkpoint inspection, recovery, and the Hermes-launcher contract.
+
 ## Markets
 
 19 exchanges supported — US, India (NSE/BSE), Japan, UK, Germany, France, Canada, Australia, Hong Kong, China, South Korea, Singapore, Brazil, Taiwan, Italy, Spain, Sweden, Switzerland.

@@ -9,11 +9,11 @@ import (
 
 // Config is the top-level configuration structure.
 type Config struct {
-	General   GeneralConfig              `toml:"general"`
-	Screeners map[string]ScreenerConfig  `toml:"screeners"`
-	Pairs     PairsConfig                `toml:"pairs"`
-	Backtest  BacktestConfig             `toml:"backtest"`
-	Scoring   ScoringConfig              `toml:"scoring"`
+	General   GeneralConfig             `toml:"general"`
+	Screeners map[string]ScreenerConfig `toml:"screeners"`
+	Pairs     PairsConfig               `toml:"pairs"`
+	Backtest  BacktestConfig            `toml:"backtest"`
+	Scoring   ScoringConfig             `toml:"scoring"`
 }
 
 // ScoringConfig controls how filter importance levels are weighted.
@@ -32,23 +32,25 @@ type GeneralConfig struct {
 }
 
 type ScreenerConfig struct {
+	MinPrice float64 `toml:"min_price"`
+
 	// BreakoutCaution
-	BollingerPeriod    int     `toml:"bollinger_period"`
-	BollingerStd       float64 `toml:"bollinger_std"`
-	VolumeMultiplier   float64 `toml:"volume_multiplier"`
-	SMAWindow          int     `toml:"sma_window"`
-	ATRWindow          int     `toml:"atr_window"`
-	RSThreshold        float64 `toml:"rs_threshold"`
-	MomentumPeriod     int     `toml:"momentum_period"`
-	MomentumThreshold  float64 `toml:"momentum_threshold"`
+	BollingerPeriod   int     `toml:"bollinger_period"`
+	BollingerStd      float64 `toml:"bollinger_std"`
+	VolumeMultiplier  float64 `toml:"volume_multiplier"`
+	SMAWindow         int     `toml:"sma_window"`
+	ATRWindow         int     `toml:"atr_window"`
+	RSThreshold       float64 `toml:"rs_threshold"`
+	MomentumPeriod    int     `toml:"momentum_period"`
+	MomentumThreshold float64 `toml:"momentum_threshold"`
 
 	// HighPerformance
-	SMA200IncreaseDays   int     `toml:"sma_200_increase_days"`
-	MaxCloseCheckpoints  int     `toml:"max_close_checkpoints"`
-	MinDataDays          int     `toml:"min_data_days"`
-	DoubleFromLow        bool    `toml:"double_from_low"`
-	DrawdownFloor        float64 `toml:"drawdown_floor"`
-	HighFloor            float64 `toml:"high_floor"`
+	SMA200IncreaseDays  int     `toml:"sma_200_increase_days"`
+	MaxCloseCheckpoints int     `toml:"max_close_checkpoints"`
+	MinDataDays         int     `toml:"min_data_days"`
+	DoubleFromLow       bool    `toml:"double_from_low"`
+	DrawdownFloor       float64 `toml:"drawdown_floor"`
+	HighFloor           float64 `toml:"high_floor"`
 
 	// StellarBreakout
 	FibonacciLevel       float64 `toml:"fibonacci_level"`
@@ -72,14 +74,14 @@ type PairsConfig struct {
 }
 
 type BacktestConfig struct {
-	TPMin          float64 `toml:"tp_min"`
-	TPMax          float64 `toml:"tp_max"`
-	TPStep         float64 `toml:"tp_step"`
-	SLMin          float64 `toml:"sl_min"`
-	SLMax          float64 `toml:"sl_max"`
-	SLStep         float64 `toml:"sl_step"`
-	Capital        float64 `toml:"capital"`
-	MinRewardRisk  float64 `toml:"min_reward_risk"`
+	TPMin         float64 `toml:"tp_min"`
+	TPMax         float64 `toml:"tp_max"`
+	TPStep        float64 `toml:"tp_step"`
+	SLMin         float64 `toml:"sl_min"`
+	SLMax         float64 `toml:"sl_max"`
+	SLStep        float64 `toml:"sl_step"`
+	Capital       float64 `toml:"capital"`
+	MinRewardRisk float64 `toml:"min_reward_risk"`
 }
 
 // StockctlDir returns the base directory for all stockctl data: ~/.stockctl/
@@ -123,9 +125,6 @@ func Load(path string) (*Config, error) {
 
 func setDefaults(cfg *Config) {
 	// General
-	if cfg.General.MinPrice == 0 {
-		cfg.General.MinPrice = 5.0
-	}
 	if cfg.General.Workers == 0 {
 		cfg.General.Workers = 8
 	}

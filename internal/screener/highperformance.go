@@ -17,6 +17,9 @@ type HighPerformance struct {
 }
 
 func NewHighPerformance(cfg config.ScreenerConfig, scoring config.ScoringConfig) *HighPerformance {
+	if cfg.MinPrice == 0 {
+		cfg.MinPrice = 5.0
+	}
 	if cfg.MinDataDays == 0 {
 		cfg.MinDataDays = 756
 	}
@@ -33,7 +36,7 @@ func NewHighPerformance(cfg config.ScreenerConfig, scoring config.ScoringConfig)
 }
 
 func (h *HighPerformance) Name() string        { return "high-performance" }
-func (h *HighPerformance) Description() string  { return "Sustained uptrend with consistent new highs" }
+func (h *HighPerformance) Description() string { return "Sustained uptrend with consistent new highs" }
 
 func (h *HighPerformance) Screen(_ context.Context, data []marketdata.OHLCV, _ []marketdata.OHLCV) (*ScreenResult, error) {
 	if len(data) < h.cfg.MinDataDays {
@@ -49,7 +52,7 @@ func (h *HighPerformance) Screen(_ context.Context, data []marketdata.OHLCV, _ [
 	// 1. Min price (minor)
 	price := closes[n-1]
 	filters = append(filters, MakeFilter(
-		"min_price", price > 5.0, price, 5.0, ImportanceMinor, "",
+		"min_price", price >= h.cfg.MinPrice, price, h.cfg.MinPrice, ImportanceMinor, "",
 	))
 
 	// 2. Golden cross: SMA(50) > SMA(200) (critical)

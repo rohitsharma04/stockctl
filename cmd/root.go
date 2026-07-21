@@ -176,6 +176,9 @@ var marketsCmd = &cobra.Command{
 			Currency       string  `json:"currency"`
 			CurrencySymbol string  `json:"currency_symbol"`
 			MinPrice       float64 `json:"min_price"`
+			Timezone       string  `json:"timezone"`
+			SessionOpen    string  `json:"session_open"`
+			SessionClose   string  `json:"session_close"`
 		}
 
 		if output.Format(outFmt) == output.FormatJSON {
@@ -186,6 +189,7 @@ var marketsCmd = &cobra.Command{
 					ID: m.ID, Name: m.Name, Suffix: m.Suffix,
 					Benchmark: m.Benchmark, Currency: m.Currency,
 					CurrencySymbol: m.CurrencySymbol, MinPrice: m.MinPrice,
+					Timezone: m.Timezone, SessionOpen: m.SessionOpen, SessionClose: m.SessionClose,
 				})
 			}
 			env := output.Envelope{

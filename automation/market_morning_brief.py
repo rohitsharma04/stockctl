@@ -125,12 +125,21 @@ def scan_is_usable(scan: dict) -> tuple[bool, str]:
     quality = meta.get("data_quality") or {}
     scanned = int(meta.get("tickers_scanned") or 0)
     failed = int(meta.get("tickers_failed") or 0)
+    partial = int(quality.get("tickers_partial") or 0)
+    stale = int(quality.get("stale_tickers") or 0)
     if scanned < 400:
         return False, f"only {scanned} tickers scanned"
     if failed > max(25, int(scanned * 0.15)):
         return False, f"{failed}/{scanned} ticker fetches failed"
+    if partial > max(50, int(scanned * 0.20)):
+        return False, f"{partial}/{scanned} ticker fetches partial"
+    if stale > max(25, int(scanned * 0.10)):
+        return False, f"{stale}/{scanned} ticker stale fallbacks"
     if not quality.get("benchmark_available"):
         return False, "benchmark unavailable"
+    expected_as_of = str(scan.get("meta", {}).get("as_of_date") or "")
+    if expected_as_of and quality.get("data_as_of") and quality["data_as_of"] < expected_as_of:
+        return False, f"data only available as of {quality['data_as_of']}, expected {expected_as_of}"
     return True, ""
 
 

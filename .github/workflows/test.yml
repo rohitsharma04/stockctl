@@ -1,0 +1,26 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.5"
+          cache: true
+      - name: Test
+        run: go test -race ./...
+      - name: Build
+        run: go build -o bin/stockctl .
+      - name: Verify Hermes launcher syntax
+        run: python3 -m py_compile automation/stockctl_weekend_seed.py
