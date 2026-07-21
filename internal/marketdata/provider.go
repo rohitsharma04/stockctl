@@ -28,10 +28,11 @@ type HistoryProvider interface {
 // providers. AsOf is optional; when set, a cache that covers that date can be
 // served without refreshing upstream.
 type HistoryRequest struct {
-	Symbol   string
-	Period   string
-	Interval string
-	AsOf     time.Time
+	Symbol                string
+	Period                string
+	Interval              string
+	AsOf                  time.Time
+	RequireCompletePeriod bool // bypasses bounded cold-cache fetches; intended for durable history seeding
 }
 
 type HistorySource string

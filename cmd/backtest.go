@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/csv"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -57,27 +58,22 @@ func runBacktest(cmd *cobra.Command, args []string) error {
 	startTime := time.Now()
 
 	// Parse range overrides
-	tpMin, tpMax, tpStep := cfg.TPMin, cfg.TPMax, cfg.TPStep
-	if btTPRange != "" {
-		parts := strings.Split(btTPRange, ":")
-		if len(parts) == 2 {
-			tpMin, _ = strconv.ParseFloat(parts[0], 64)
-			tpMax, _ = strconv.ParseFloat(parts[1], 64)
-		}
+	tpMin, tpMax, err := parseBacktestRange("--tp-range", btTPRange, cfg.TPMin, cfg.TPMax)
+	if err != nil {
+		return err
 	}
-
-	slMin, slMax, slStep := cfg.SLMin, cfg.SLMax, cfg.SLStep
-	if btSLRange != "" {
-		parts := strings.Split(btSLRange, ":")
-		if len(parts) == 2 {
-			slMin, _ = strconv.ParseFloat(parts[0], 64)
-			slMax, _ = strconv.ParseFloat(parts[1], 64)
-		}
+	slMin, slMax, err := parseBacktestRange("--sl-range", btSLRange, cfg.SLMin, cfg.SLMax)
+	if err != nil {
+		return err
 	}
-
 	capital := cfg.Capital
-	if btCapital > 0 {
+	if btCapital != 0 {
 		capital = btCapital
+	}
+	tpStep, slStep := cfg.TPStep, cfg.SLStep
+	params := backtestParameters{tpMin: tpMin, tpMax: tpMax, tpStep: tpStep, slMin: slMin, slMax: slMax, slStep: slStep, minRewardRisk: cfg.MinRewardRisk, capital: capital}
+	if err := validateBacktestParameters(params); err != nil {
+		return err
 	}
 
 	// Load entries — either from strategy scan or CSV file
@@ -126,7 +122,7 @@ func runBacktest(cmd *cobra.Command, args []string) error {
 	// JSON output with envelope
 	if appConfig.General.Output == "json" {
 		type btResult struct {
-			Optimized []backtest.TradeResult   `json:"optimized"`
+			Optimized []backtest.TradeResult     `json:"optimized"`
 			Metrics   []backtest.StrategyMetrics `json:"metrics"`
 		}
 		var metrics []backtest.StrategyMetrics
@@ -205,6 +201,61 @@ func runBacktest(cmd *cobra.Command, args []string) error {
 
 	fmt.Println("\n✅ Backtest completed.")
 	return nil
+}
+
+type backtestParameters struct {
+	tpMin, tpMax, tpStep float64
+	slMin, slMax, slStep float64
+	minRewardRisk        float64
+	capital              float64
+}
+
+func parseBacktestRange(flag, value string, defaultMin, defaultMax float64) (float64, float64, error) {
+	if value == "" {
+		return defaultMin, defaultMax, nil
+	}
+	parts := strings.Split(value, ":")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("%s must be min:max", flag)
+	}
+	min, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	if err != nil || !isPositiveFinite(min) {
+		return 0, 0, fmt.Errorf("%s minimum must be a positive finite number", flag)
+	}
+	max, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if err != nil || !isPositiveFinite(max) {
+		return 0, 0, fmt.Errorf("%s maximum must be a positive finite number", flag)
+	}
+	if min > max {
+		return 0, 0, fmt.Errorf("%s minimum must not exceed maximum", flag)
+	}
+	return min, max, nil
+}
+
+func validateBacktestParameters(p backtestParameters) error {
+	for _, field := range []struct {
+		name  string
+		value float64
+	}{
+		{"take-profit minimum", p.tpMin}, {"take-profit maximum", p.tpMax}, {"take-profit step", p.tpStep},
+		{"stop-loss minimum", p.slMin}, {"stop-loss maximum", p.slMax}, {"stop-loss step", p.slStep},
+		{"capital", p.capital},
+	} {
+		if !isPositiveFinite(field.value) {
+			return fmt.Errorf("backtest %s must be a positive finite number", field.name)
+		}
+	}
+	if p.tpMin > p.tpMax || p.slMin > p.slMax {
+		return fmt.Errorf("backtest range minimum must not exceed maximum")
+	}
+	if math.IsNaN(p.minRewardRisk) || math.IsInf(p.minRewardRisk, 0) || p.minRewardRisk < 0 {
+		return fmt.Errorf("backtest minimum reward/risk must be a non-negative finite number")
+	}
+	return nil
+}
+
+func isPositiveFinite(v float64) bool {
+	return v > 0 && !math.IsNaN(v) && !math.IsInf(v, 0)
 }
 
 func loadBreakoutEntries(path string) ([]backtest.BreakoutEntry, error) {

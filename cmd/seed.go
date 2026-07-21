@@ -101,6 +101,9 @@ func newSeedHistoryCmd() *cobra.Command {
 			}
 			markets = uniqueStrings(markets)
 			sort.Strings(markets)
+			if noCache {
+				return errors.New("seed history cannot use --no-cache because it would not populate the disk cache")
+			}
 			if stateFile == "" {
 				stateFile = filepath.Join(config.StockctlDir(), "seed-history-state.json")
 			}
@@ -237,7 +240,7 @@ func newSeedHistoryCmd() *cobra.Command {
 
 func seedGetHistory(ctx context.Context, provider marketdata.Provider, ticker, period string, summary *seedSummary) error {
 	if hp, ok := provider.(marketdata.HistoryProvider); ok {
-		result, err := hp.GetHistoryWithProvenance(ctx, marketdata.HistoryRequest{Symbol: ticker, Period: period, Interval: "1d"})
+		result, err := hp.GetHistoryWithProvenance(ctx, marketdata.HistoryRequest{Symbol: ticker, Period: period, Interval: "1d", RequireCompletePeriod: true})
 		if err == nil {
 			switch result.Provenance.Source {
 			case marketdata.HistorySourceCache:
@@ -247,6 +250,10 @@ func seedGetHistory(ctx context.Context, provider marketdata.Provider, ticker, p
 			}
 			if result.Provenance.Stale {
 				summary.Stale++
+				if result.Provenance.UpstreamError != "" {
+					return fmt.Errorf("stale cache fallback: %s", result.Provenance.UpstreamError)
+				}
+				return errors.New("stale cache fallback")
 			}
 		}
 		return err

@@ -147,6 +147,9 @@ func (d *DiskCachedProvider) GetHistoryWithProvenance(ctx context.Context, req H
 	if cacheErr != nil || len(entry.Data) == 0 {
 		// No cache — full fetch
 		fetchPeriod := initialFetchPeriod(period, interval)
+		if req.RequireCompletePeriod {
+			fetchPeriod = period
+		}
 		data, err := d.inner.GetHistory(ctx, symbol, fetchPeriod, interval)
 		if err != nil {
 			return nil, err
@@ -167,7 +170,7 @@ func (d *DiskCachedProvider) GetHistoryWithProvenance(ctx context.Context, req H
 		}, nil
 	}
 
-	if cacheCoversRequest(entry, req) {
+	if !req.RequireCompletePeriod && cacheCoversRequest(entry, req) {
 		data := filterBarsAsOf(entry.Data, req.AsOf)
 		return &HistoryResult{
 			Data: data,
@@ -181,7 +184,9 @@ func (d *DiskCachedProvider) GetHistoryWithProvenance(ctx context.Context, req H
 
 	// Cache exists — fetch missing history or refresh the tail.
 	fetchPeriod := deltaPeriodAsOf(entry.LastBarDate, req.AsOf, period)
-	if missingHistoricalStartCoverage(entry, req) {
+	if req.RequireCompletePeriod {
+		fetchPeriod = period
+	} else if missingHistoricalStartCoverage(entry, req) {
 		fetchPeriod = initialFetchPeriod(period, interval)
 	}
 	fresh, err := d.inner.GetHistory(ctx, symbol, fetchPeriod, interval)

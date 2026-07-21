@@ -196,6 +196,22 @@ func TestDiskCache_CacheFileCreated(t *testing.T) {
 	}
 }
 
+func TestDiskCache_CompletePeriodRequestFetchesRequestedTenYears(t *testing.T) {
+	tmpDir := t.TempDir()
+	provider := &recordingProvider{data: []OHLCV{{Date: time.Date(2016, 1, 1, 0, 0, 0, 0, time.UTC), Close: 100}}}
+	dc := &DiskCachedProvider{inner: provider, cacheDir: tmpDir}
+
+	_, err := dc.GetHistoryWithProvenance(context.Background(), HistoryRequest{
+		Symbol: "COMPLETE", Period: "10y", Interval: "1d", RequireCompletePeriod: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.calls) != 1 || provider.calls[0].period != "10y" {
+		t.Fatalf("upstream calls = %#v, want one 10y fetch", provider.calls)
+	}
+}
+
 func TestDiskCache_GetHistoryWithProvenanceCacheHitSkipsUpstream(t *testing.T) {
 	tmpDir := t.TempDir()
 	mock := &mockProvider{

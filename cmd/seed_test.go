@@ -25,6 +25,42 @@ type seedTestProvider struct {
 	blockOnCall int
 }
 
+type staleSeedProvider struct{ *seedTestProvider }
+
+func (p *staleSeedProvider) GetHistoryWithProvenance(_ context.Context, req marketdata.HistoryRequest) (*marketdata.HistoryResult, error) {
+	p.mu.Lock()
+	p.calls[req.Symbol]++
+	p.mu.Unlock()
+	return &marketdata.HistoryResult{Data: []marketdata.OHLCV{{Close: 100}}, Provenance: marketdata.HistoryProvenance{
+		Source: marketdata.HistorySourceCache, Stale: true, UpstreamError: "HTTP 503 temporary network failure",
+	}}, nil
+}
+
+func TestSeedHistoryRejectsNoCache(t *testing.T) {
+	oldNoCache := noCache
+	noCache = true
+	t.Cleanup(func() { noCache = oldNoCache })
+
+	command := newSeedHistoryCmd()
+	command.SetArgs([]string{"--market", "us", "--state-file", filepath.Join(t.TempDir(), "state.json")})
+	err := command.Execute()
+	if err == nil || err.Error() != "seed history cannot use --no-cache because it would not populate the disk cache" {
+		t.Fatalf("--no-cache error = %v", err)
+	}
+}
+
+func TestSeedGetHistoryTreatsStaleFallbackAsFailure(t *testing.T) {
+	provider := &staleSeedProvider{seedTestProvider: &seedTestProvider{calls: map[string]int{}}}
+	summary := &seedSummary{}
+	err := seedGetHistory(context.Background(), provider, "STALE", "max", summary)
+	if err == nil || err.Error() != "stale cache fallback: HTTP 503 temporary network failure" {
+		t.Fatalf("stale fallback error = %v", err)
+	}
+	if summary.Stale != 1 || summary.CacheHits != 1 {
+		t.Fatalf("summary = %#v, want one stale cache hit", summary)
+	}
+}
+
 func (p *seedTestProvider) GetHistory(ctx context.Context, symbol, period, interval string) ([]marketdata.OHLCV, error) {
 	p.mu.Lock()
 	p.calls[symbol]++
