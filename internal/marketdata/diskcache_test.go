@@ -2,10 +2,12 @@ package marketdata
 
 import (
 	"context"
+	"encoding/gob"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -198,6 +200,7 @@ func TestDiskCache_GetHistoryWithProvenanceCacheHitSkipsUpstream(t *testing.T) {
 	tmpDir := t.TempDir()
 	mock := &mockProvider{
 		data: []OHLCV{
+			{Date: time.Date(2020, 3, 27, 0, 0, 0, 0, time.UTC), Close: 80},
 			{Date: time.Date(2025, 3, 25, 0, 0, 0, 0, time.UTC), Close: 100},
 			{Date: time.Date(2025, 3, 26, 0, 0, 0, 0, time.UTC), Close: 105},
 			{Date: time.Date(2025, 3, 27, 0, 0, 0, 0, time.UTC), Close: 110},
@@ -239,6 +242,7 @@ func TestDiskCache_GetHistoryWithProvenanceTailFetchUsesFiveDayOverlapAndMerges(
 	tmpDir := t.TempDir()
 	mock := &recordingProvider{
 		data: []OHLCV{
+			{Date: time.Date(2020, 3, 28, 0, 0, 0, 0, time.UTC), Close: 80},
 			{Date: time.Date(2025, 3, 25, 0, 0, 0, 0, time.UTC), Close: 100},
 			{Date: time.Date(2025, 3, 26, 0, 0, 0, 0, time.UTC), Close: 105},
 			{Date: time.Date(2025, 3, 27, 0, 0, 0, 0, time.UTC), Close: 110},
@@ -276,11 +280,234 @@ func TestDiskCache_GetHistoryWithProvenanceTailFetchUsesFiveDayOverlapAndMerges(
 	if result.Provenance.Source != HistorySourceCacheAndUpstream {
 		t.Fatalf("source = %q, want %q", result.Provenance.Source, HistorySourceCacheAndUpstream)
 	}
-	if len(result.Data) != 4 {
-		t.Fatalf("expected 4 merged bars, got %d", len(result.Data))
+	if len(result.Data) != 5 {
+		t.Fatalf("expected 5 merged bars, got %d", len(result.Data))
 	}
-	if result.Data[1].Close != 106 || result.Data[2].Close != 111 || result.Data[3].Close != 115 {
-		t.Fatalf("unexpected merged closes: %.0f %.0f %.0f", result.Data[1].Close, result.Data[2].Close, result.Data[3].Close)
+	if result.Data[2].Close != 106 || result.Data[3].Close != 111 || result.Data[4].Close != 115 {
+		t.Fatalf("unexpected merged closes: %.0f %.0f %.0f", result.Data[2].Close, result.Data[3].Close, result.Data[4].Close)
+	}
+}
+
+func TestDiskCache_FileLockHonorsContextCancellation(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "LOCKED_5y_1d.gob")
+
+	unlockFirst, err := acquireCacheFileLock(context.Background(), path)
+	if err != nil {
+		t.Fatalf("first lock failed: %v", err)
+	}
+	defer unlockFirst()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	unlockSecond, err := acquireCacheFileLock(ctx, path)
+	if err == nil {
+		if unlockSecond != nil {
+			unlockSecond()
+		}
+		t.Fatal("second lock unexpectedly ignored context cancellation")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("lock error = %v, want context.Canceled", err)
+	}
+}
+
+func TestDiskCache_PerKeyLockCoversReadFetchMergeWriteAndPreventsLostUpdates(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, diskCacheFilename("RACE", "5y", "1d"))
+	seedDiskCacheEntry(t, path, diskCacheEntry{
+		FetchedAt:   time.Date(2025, 3, 27, 12, 0, 0, 0, time.UTC),
+		LastBarDate: time.Date(2025, 3, 27, 0, 0, 0, 0, time.UTC),
+		OrigPeriod:  "5y",
+		Data: []OHLCV{
+			{Date: time.Date(2025, 3, 27, 0, 0, 0, 0, time.UTC), Close: 100},
+		},
+	})
+
+	provider := newSequencedBlockingProvider([][]OHLCV{
+		{{Date: time.Date(2025, 3, 28, 0, 0, 0, 0, time.UTC), Close: 128}},
+		{{Date: time.Date(2025, 3, 29, 0, 0, 0, 0, time.UTC), Close: 129}},
+	})
+	dc := &DiskCachedProvider{inner: provider, cacheDir: tmpDir}
+
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			_, err := dc.GetHistoryWithProvenance(context.Background(), HistoryRequest{
+				Symbol: "RACE", Period: "5y", Interval: "1d", AsOf: time.Date(2025, 3, 29, 12, 0, 0, 0, time.UTC),
+			})
+			errs <- err
+		}()
+	}
+
+	provider.waitForCall(t, 1)
+	<-provider.callStarted
+	select {
+	case <-provider.callStarted:
+		t.Fatal("second fetch started while first caller should hold the per-key cache lock")
+	case <-time.After(50 * time.Millisecond):
+	}
+	provider.releaseNext()
+
+	if err := <-errs; err != nil {
+		t.Fatalf("first cache call failed: %v", err)
+	}
+
+	provider.waitForCall(t, 2)
+	provider.releaseNext()
+	if err := <-errs; err != nil {
+		t.Fatalf("second cache call failed: %v", err)
+	}
+
+	entry, err := dc.readCache(path)
+	if err != nil {
+		t.Fatalf("read final cache: %v", err)
+	}
+	if got, want := closesByDate(entry.Data), map[string]float64{"2025-03-27": 100, "2025-03-28": 128, "2025-03-29": 129}; !sameCloseMap(got, want) {
+		t.Fatalf("final cache bars = %v, want %v", got, want)
+	}
+}
+
+func TestDiskCache_AsOfRequiresFullRequestedPeriodCoverage(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, diskCacheFilename("COVER", "1y", "1d"))
+	seedDiskCacheEntry(t, path, diskCacheEntry{
+		FetchedAt:   time.Date(2025, 3, 28, 12, 0, 0, 0, time.UTC),
+		LastBarDate: time.Date(2025, 3, 28, 0, 0, 0, 0, time.UTC),
+		OrigPeriod:  "1y",
+		Data: []OHLCV{
+			{Date: time.Date(2025, 3, 27, 0, 0, 0, 0, time.UTC), Close: 127},
+			{Date: time.Date(2025, 3, 28, 0, 0, 0, 0, time.UTC), Close: 128},
+		},
+	})
+	mock := &recordingProvider{
+		data: []OHLCV{
+			{Date: time.Date(2024, 3, 28, 0, 0, 0, 0, time.UTC), Close: 90},
+			{Date: time.Date(2025, 3, 29, 0, 0, 0, 0, time.UTC), Close: 129},
+		},
+	}
+	dc := &DiskCachedProvider{inner: mock, cacheDir: tmpDir}
+
+	result, err := dc.GetHistoryWithProvenance(context.Background(), HistoryRequest{
+		Symbol: "COVER", Period: "1y", Interval: "1d", AsOf: time.Date(2025, 3, 28, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("history failed: %v", err)
+	}
+	if len(mock.calls) != 1 {
+		t.Fatalf("partial cache coverage should call upstream, got %d calls", len(mock.calls))
+	}
+	if mock.calls[0].period != "5y" {
+		t.Fatalf("missing historical start coverage should backfill with 5y, got %q", mock.calls[0].period)
+	}
+	if result.Provenance.Source != HistorySourceCacheAndUpstream {
+		t.Fatalf("source = %q, want %q", result.Provenance.Source, HistorySourceCacheAndUpstream)
+	}
+	if got, want := closesByDate(result.Data), map[string]float64{"2024-03-28": 90, "2025-03-27": 127, "2025-03-28": 128}; !sameCloseMap(got, want) {
+		t.Fatalf("backfilled result bars = %v, want %v", got, want)
+	}
+}
+
+func TestDiskCache_AsOfCacheHitFiltersBarsAfterAsOf(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, diskCacheFilename("FILTER", "5y", "1d"))
+	seedDiskCacheEntry(t, path, diskCacheEntry{
+		FetchedAt:   time.Date(2025, 3, 30, 12, 0, 0, 0, time.UTC),
+		LastBarDate: time.Date(2025, 3, 27, 0, 0, 0, 0, time.UTC),
+		OrigPeriod:  "5y",
+		Data: []OHLCV{
+			{Date: time.Date(2025, 3, 29, 0, 0, 0, 0, time.UTC), Close: 129},
+			{Date: time.Date(2025, 3, 27, 0, 0, 0, 0, time.UTC), Close: 127},
+			{Date: time.Date(2025, 3, 30, 0, 0, 0, 0, time.UTC), Close: 130},
+			{Date: time.Date(2020, 3, 28, 0, 0, 0, 0, time.UTC), Close: 80},
+			{Date: time.Date(2025, 3, 28, 0, 0, 0, 0, time.UTC), Close: 128},
+		},
+	})
+	mock := &recordingProvider{}
+	dc := &DiskCachedProvider{inner: mock, cacheDir: tmpDir}
+
+	result, err := dc.GetHistoryWithProvenance(context.Background(), HistoryRequest{
+		Symbol: "FILTER", Period: "5y", Interval: "1d", AsOf: time.Date(2025, 3, 28, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("history failed: %v", err)
+	}
+	if len(mock.calls) != 0 {
+		t.Fatalf("full 5y AsOf cache hit should not call upstream, got %d calls", len(mock.calls))
+	}
+	if result.Provenance.Source != HistorySourceCache {
+		t.Fatalf("source = %q, want %q", result.Provenance.Source, HistorySourceCache)
+	}
+	if !sameDay(result.Provenance.LastBarDate, time.Date(2025, 3, 28, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("last bar date = %s, want 2025-03-28", result.Provenance.LastBarDate.Format("2006-01-02"))
+	}
+	if got, want := closesByDate(result.Data), map[string]float64{"2020-03-28": 80, "2025-03-27": 127, "2025-03-28": 128}; !sameCloseMap(got, want) {
+		t.Fatalf("filtered result bars = %v, want %v", got, want)
+	}
+}
+
+func TestDiskCache_AsOfMaxNeverClaimsFullHistoricalCoverage(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, diskCacheFilename("MAXCOVER", "max", "1d"))
+	seedDiskCacheEntry(t, path, diskCacheEntry{
+		FetchedAt:   time.Date(2025, 3, 28, 12, 0, 0, 0, time.UTC),
+		LastBarDate: time.Date(2025, 3, 28, 0, 0, 0, 0, time.UTC),
+		OrigPeriod:  "max",
+		Data: []OHLCV{
+			{Date: time.Date(2020, 3, 28, 0, 0, 0, 0, time.UTC), Close: 80},
+			{Date: time.Date(2025, 3, 28, 0, 0, 0, 0, time.UTC), Close: 128},
+		},
+	})
+	mock := &recordingProvider{
+		data: []OHLCV{
+			{Date: time.Date(2019, 3, 28, 0, 0, 0, 0, time.UTC), Close: 70},
+			{Date: time.Date(2025, 3, 29, 0, 0, 0, 0, time.UTC), Close: 129},
+		},
+	}
+	dc := &DiskCachedProvider{inner: mock, cacheDir: tmpDir}
+
+	result, err := dc.GetHistoryWithProvenance(context.Background(), HistoryRequest{
+		Symbol: "MAXCOVER", Period: "max", Interval: "1d", AsOf: time.Date(2025, 3, 28, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("history failed: %v", err)
+	}
+	if len(mock.calls) != 1 {
+		t.Fatalf("max AsOf cache should not be treated as complete, got %d upstream calls", len(mock.calls))
+	}
+	if mock.calls[0].period != "5y" {
+		t.Fatalf("daily max AsOf backfill period = %q, want 5y", mock.calls[0].period)
+	}
+	if result.Provenance.Source != HistorySourceCacheAndUpstream {
+		t.Fatalf("source = %q, want %q", result.Provenance.Source, HistorySourceCacheAndUpstream)
+	}
+	if got, want := closesByDate(result.Data), map[string]float64{"2019-03-28": 70, "2020-03-28": 80, "2025-03-28": 128}; !sameCloseMap(got, want) {
+		t.Fatalf("max backfilled result bars = %v, want %v", got, want)
+	}
+}
+
+func TestDiskCache_FirstDailyHistoryPopulationFetchesFiveYears(t *testing.T) {
+	tmpDir := t.TempDir()
+	mock := &recordingProvider{
+		data: []OHLCV{{Date: time.Date(2025, 3, 28, 0, 0, 0, 0, time.UTC), Close: 128}},
+	}
+	dc := &DiskCachedProvider{inner: mock, cacheDir: tmpDir}
+
+	result, err := dc.GetHistoryWithProvenance(context.Background(), HistoryRequest{
+		Symbol: "SHORT", Period: "1mo", Interval: "1d",
+	})
+	if err != nil {
+		t.Fatalf("initial daily history fetch failed: %v", err)
+	}
+	if len(mock.calls) != 1 {
+		t.Fatalf("expected 1 upstream call, got %d", len(mock.calls))
+	}
+	if mock.calls[0].period != "5y" {
+		t.Fatalf("first daily history population period = %q, want 5y", mock.calls[0].period)
+	}
+	if result.Provenance.Source != HistorySourceUpstream {
+		t.Fatalf("source = %q, want %q", result.Provenance.Source, HistorySourceUpstream)
 	}
 }
 
@@ -423,6 +650,103 @@ func (r *recordingProvider) GetHistory(_ context.Context, symbol, period, interv
 
 func (r *recordingProvider) GetQuote(_ context.Context, symbol string) (*Quote, error) {
 	return &Quote{Symbol: symbol, Price: 100}, nil
+}
+
+type sequencedBlockingProvider struct {
+	mu          sync.Mutex
+	responses   [][]OHLCV
+	next        int
+	callStarted chan struct{}
+	releases    chan struct{}
+	calls       []historyCall
+}
+
+func newSequencedBlockingProvider(responses [][]OHLCV) *sequencedBlockingProvider {
+	return &sequencedBlockingProvider{
+		responses:   responses,
+		callStarted: make(chan struct{}, len(responses)),
+		releases:    make(chan struct{}, len(responses)),
+	}
+}
+
+func (s *sequencedBlockingProvider) GetHistory(_ context.Context, symbol, period, interval string) ([]OHLCV, error) {
+	s.mu.Lock()
+	idx := s.next
+	s.next++
+	s.calls = append(s.calls, historyCall{symbol: symbol, period: period, interval: interval})
+	s.mu.Unlock()
+
+	s.callStarted <- struct{}{}
+	<-s.releases
+
+	if idx >= len(s.responses) {
+		return nil, errors.New("unexpected history call")
+	}
+	return s.responses[idx], nil
+}
+
+func (s *sequencedBlockingProvider) GetQuote(_ context.Context, symbol string) (*Quote, error) {
+	return &Quote{Symbol: symbol, Price: 100}, nil
+}
+
+func (s *sequencedBlockingProvider) waitForCall(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		s.mu.Lock()
+		got := len(s.calls)
+		s.mu.Unlock()
+		if got >= want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %d history calls, got %d", want, got)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func (s *sequencedBlockingProvider) releaseNext() {
+	s.releases <- struct{}{}
+}
+
+func seedDiskCacheEntry(t *testing.T, path string, entry diskCacheEntry) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatalf("mkdir cache dir: %v", err)
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create cache seed: %v", err)
+	}
+	if err := gob.NewEncoder(f).Encode(entry); err != nil {
+		_ = f.Close()
+		t.Fatalf("encode cache seed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close cache seed: %v", err)
+	}
+}
+
+func closesByDate(data []OHLCV) map[string]float64 {
+	out := make(map[string]float64, len(data))
+	for _, bar := range data {
+		out[bar.Date.Format("2006-01-02")] = bar.Close
+	}
+	return out
+}
+
+func sameCloseMap(a, b map[string]float64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for key, av := range a {
+		if b[key] != av {
+			return false
+		}
+	}
+	return true
 }
 
 func sameDay(a, b time.Time) bool {

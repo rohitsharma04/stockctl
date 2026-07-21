@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/rohitsharma04/stockctl/internal/config"
@@ -133,48 +135,65 @@ func (d *DiskCachedProvider) GetHistoryWithProvenance(ctx context.Context, req H
 	symbol, period, interval := req.Symbol, req.Period, req.Interval
 	path := filepath.Join(d.cacheDir, diskCacheFilename(symbol, period, interval))
 
+	unlock, err := acquireCacheFileLock(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
 	// Try reading existing cache
 	entry, cacheErr := d.readCache(path)
 
 	if cacheErr != nil || len(entry.Data) == 0 {
 		// No cache — full fetch
-		data, err := d.inner.GetHistory(ctx, symbol, period, interval)
+		fetchPeriod := initialFetchPeriod(period, interval)
+		data, err := d.inner.GetHistory(ctx, symbol, fetchPeriod, interval)
 		if err != nil {
 			return nil, err
 		}
-		fetchedAt, lastBar := d.writeCache(path, data, period)
+		fetchedAt, _, err := d.writeCache(path, data, period)
+		if err != nil {
+			return nil, err
+		}
+		resultData := filterBarsAsOf(data, req.AsOf)
+		resultLastBar := lastBarDate(resultData)
 		return &HistoryResult{
-			Data: data,
+			Data: resultData,
 			Provenance: HistoryProvenance{
 				Source:      HistorySourceUpstream,
 				FetchedAt:   fetchedAt,
-				LastBarDate: lastBar,
+				LastBarDate: resultLastBar,
 			},
 		}, nil
 	}
 
 	if cacheCoversRequest(entry, req) {
+		data := filterBarsAsOf(entry.Data, req.AsOf)
 		return &HistoryResult{
-			Data: entry.Data,
+			Data: data,
 			Provenance: HistoryProvenance{
 				Source:      HistorySourceCache,
 				FetchedAt:   entry.FetchedAt,
-				LastBarDate: entry.LastBarDate,
+				LastBarDate: lastBarDate(data),
 			},
 		}, nil
 	}
 
-	// Cache exists — fetch delta
-	dp := deltaPeriodAsOf(entry.LastBarDate, req.AsOf, period)
-	fresh, err := d.inner.GetHistory(ctx, symbol, dp, interval)
+	// Cache exists — fetch missing history or refresh the tail.
+	fetchPeriod := deltaPeriodAsOf(entry.LastBarDate, req.AsOf, period)
+	if missingHistoricalStartCoverage(entry, req) {
+		fetchPeriod = initialFetchPeriod(period, interval)
+	}
+	fresh, err := d.inner.GetHistory(ctx, symbol, fetchPeriod, interval)
 	if err != nil {
 		// Stale-while-revalidate: return cached data on upstream failure
+		data := filterBarsAsOf(entry.Data, req.AsOf)
 		return &HistoryResult{
-			Data: entry.Data,
+			Data: data,
 			Provenance: HistoryProvenance{
 				Source:        HistorySourceCache,
 				FetchedAt:     entry.FetchedAt,
-				LastBarDate:   entry.LastBarDate,
+				LastBarDate:   lastBarDate(data),
 				Stale:         true,
 				UpstreamError: err.Error(),
 			},
@@ -183,13 +202,17 @@ func (d *DiskCachedProvider) GetHistoryWithProvenance(ctx context.Context, req H
 
 	// Merge and save
 	merged := mergeOHLCV(entry.Data, fresh)
-	fetchedAt, lastBar := d.writeCache(path, merged, period)
+	fetchedAt, _, err := d.writeCache(path, merged, period)
+	if err != nil {
+		return nil, err
+	}
+	resultData := filterBarsAsOf(merged, req.AsOf)
 	return &HistoryResult{
-		Data: merged,
+		Data: resultData,
 		Provenance: HistoryProvenance{
 			Source:      HistorySourceCacheAndUpstream,
 			FetchedAt:   fetchedAt,
-			LastBarDate: lastBar,
+			LastBarDate: lastBarDate(resultData),
 		},
 	}, nil
 }
@@ -214,10 +237,58 @@ func (d *DiskCachedProvider) readCache(path string) (*diskCacheEntry, error) {
 }
 
 func cacheCoversRequest(entry *diskCacheEntry, req HistoryRequest) bool {
-	if req.AsOf.IsZero() {
-		return sameHistoryDay(entry.LastBarDate, time.Now())
+	earliest, latest, ok := cacheDateRange(entry.Data)
+	if !ok {
+		return false
 	}
-	return !entry.LastBarDate.Before(truncateHistoryDay(req.AsOf))
+	if req.AsOf.IsZero() {
+		return sameHistoryDay(latest, time.Now())
+	}
+	start, ok := requestedPeriodStart(req.AsOf, req.Period)
+	if !ok {
+		return false
+	}
+	return coversHistoricalStart(earliest, start, req.Period) && !latest.Before(truncateHistoryDay(req.AsOf))
+}
+
+func missingHistoricalStartCoverage(entry *diskCacheEntry, req HistoryRequest) bool {
+	if req.AsOf.IsZero() {
+		return false
+	}
+	start, ok := requestedPeriodStart(req.AsOf, req.Period)
+	if !ok {
+		return false
+	}
+	earliest, _, ok := cacheDateRange(entry.Data)
+	if !ok {
+		return true
+	}
+	return !coversHistoricalStart(earliest, start, req.Period)
+}
+
+func coversHistoricalStart(earliest, start time.Time, period string) bool {
+	if period == "max" {
+		return false
+	}
+	return !earliest.After(start)
+}
+
+func cacheDateRange(data []OHLCV) (time.Time, time.Time, bool) {
+	if len(data) == 0 {
+		return time.Time{}, time.Time{}, false
+	}
+	earliest := truncateHistoryDay(data[0].Date)
+	latest := earliest
+	for _, bar := range data[1:] {
+		day := truncateHistoryDay(bar.Date)
+		if day.Before(earliest) {
+			earliest = day
+		}
+		if day.After(latest) {
+			latest = day
+		}
+	}
+	return earliest, latest, true
 }
 
 func truncateHistoryDay(t time.Time) time.Time {
@@ -228,11 +299,75 @@ func sameHistoryDay(a, b time.Time) bool {
 	return truncateHistoryDay(a).Equal(truncateHistoryDay(b))
 }
 
-func (d *DiskCachedProvider) writeCache(path string, data []OHLCV, origPeriod string) (time.Time, time.Time) {
-	lastBar := time.Time{}
-	if len(data) > 0 {
-		lastBar = data[len(data)-1].Date
+func initialFetchPeriod(period, interval string) string {
+	if interval == "1d" {
+		return "5y"
 	}
+	return period
+}
+
+func requestedPeriodStart(asOf time.Time, period string) (time.Time, bool) {
+	asOfDay := truncateHistoryDay(asOf)
+	switch period {
+	case "ytd":
+		return time.Date(asOf.Year(), 1, 1, 0, 0, 0, 0, asOf.Location()), true
+	case "max":
+		return time.Time{}, true
+	}
+
+	if strings.HasSuffix(period, "d") {
+		n, err := strconv.Atoi(strings.TrimSuffix(period, "d"))
+		if err != nil {
+			return time.Time{}, false
+		}
+		return asOfDay.AddDate(0, 0, -n), true
+	}
+	if strings.HasSuffix(period, "mo") {
+		n, err := strconv.Atoi(strings.TrimSuffix(period, "mo"))
+		if err != nil {
+			return time.Time{}, false
+		}
+		return asOfDay.AddDate(0, -n, 0), true
+	}
+	if strings.HasSuffix(period, "y") {
+		n, err := strconv.Atoi(strings.TrimSuffix(period, "y"))
+		if err != nil {
+			return time.Time{}, false
+		}
+		return asOfDay.AddDate(-n, 0, 0), true
+	}
+	return time.Time{}, false
+}
+
+func filterBarsAsOf(data []OHLCV, asOf time.Time) []OHLCV {
+	if asOf.IsZero() {
+		return data
+	}
+	asOfDay := truncateHistoryDay(asOf)
+	filtered := make([]OHLCV, 0, len(data))
+	for _, bar := range data {
+		if !truncateHistoryDay(bar.Date).After(asOfDay) {
+			filtered = append(filtered, bar)
+		}
+	}
+	return filtered
+}
+
+func lastBarDate(data []OHLCV) time.Time {
+	if len(data) == 0 {
+		return time.Time{}
+	}
+	latest := data[0].Date
+	for _, bar := range data[1:] {
+		if bar.Date.After(latest) {
+			latest = bar.Date
+		}
+	}
+	return latest
+}
+
+func (d *DiskCachedProvider) writeCache(path string, data []OHLCV, origPeriod string) (time.Time, time.Time, error) {
+	lastBar := lastBarDate(data)
 	fetchedAt := time.Now()
 	entry := diskCacheEntry{
 		FetchedAt:   fetchedAt,
@@ -241,42 +376,81 @@ func (d *DiskCachedProvider) writeCache(path string, data []OHLCV, origPeriod st
 		Data:        data,
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return fetchedAt, lastBar
+		return fetchedAt, lastBar, err
 	}
-	unlock := acquireCacheWriteLock(path)
-	defer unlock()
 
 	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
 	if err != nil {
-		return fetchedAt, lastBar
+		return fetchedAt, lastBar, err
 	}
 	tmpName := tmp.Name()
-	rename := false
-	if err := gob.NewEncoder(tmp).Encode(entry); err == nil {
-		if err := tmp.Sync(); err == nil {
-			rename = true
+	removeTmp := true
+	defer func() {
+		if removeTmp {
+			_ = os.Remove(tmpName)
 		}
+	}()
+
+	if err := gob.NewEncoder(tmp).Encode(entry); err != nil {
+		_ = tmp.Close()
+		return fetchedAt, lastBar, err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fetchedAt, lastBar, err
 	}
 	if err := tmp.Close(); err != nil {
-		rename = false
+		return fetchedAt, lastBar, err
 	}
-	if rename {
-		if err := os.Rename(tmpName, path); err == nil {
-			return fetchedAt, lastBar
+	if err := os.Rename(tmpName, path); err != nil {
+		return fetchedAt, lastBar, err
+	}
+	removeTmp = false
+	return fetchedAt, lastBar, nil
+}
+
+func acquireCacheFileLock(ctx context.Context, path string) (func(), error) {
+	lockPath := path + ".lock"
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0755); err != nil {
+		return nil, err
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0644)
+		if err != nil {
+			return nil, err
+		}
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+			return func() {
+				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+				_ = f.Close()
+			}, nil
+		} else if err != syscall.EWOULDBLOCK && err != syscall.EAGAIN {
+			_ = f.Close()
+			return nil, err
+		}
+		_ = f.Close()
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	_ = os.Remove(tmpName)
-	return fetchedAt, lastBar
 }
 
 func acquireCacheWriteLock(path string) func() {
-	lockDir := path + ".lock"
-	for {
-		if err := os.Mkdir(lockDir, 0755); err == nil {
-			return func() { _ = os.Remove(lockDir) }
-		}
-		time.Sleep(10 * time.Millisecond)
+	unlock, err := acquireCacheFileLock(context.Background(), path)
+	if err != nil {
+		return func() {}
 	}
+	return unlock
 }
 
 // CacheStats holds statistics about the disk cache.
