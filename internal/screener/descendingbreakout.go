@@ -18,7 +18,9 @@ func NewDescendingBreakout(cfg config.ScreenerConfig, scoring config.ScoringConf
 	if cfg.MinPrice == 0 {
 		cfg.MinPrice = 5.0
 	}
-	if cfg.Months == 0 {
+	// The trendline calculation reads the prior monthly bar, so smaller
+	// windows can otherwise panic at runtime when supplied via config.
+	if cfg.Months < 2 {
 		cfg.Months = 36
 	}
 	if cfg.FalseBreakoutTolerance == 0 {

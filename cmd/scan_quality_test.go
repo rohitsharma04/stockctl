@@ -8,8 +8,62 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rohitsharma04/stockctl/internal/config"
 	"github.com/rohitsharma04/stockctl/internal/marketdata"
 )
+
+func TestApplyScanOverridesAppliesMonthsOnlyToDescendingBreakout(t *testing.T) {
+	cfg := &config.Config{Screeners: map[string]config.ScreenerConfig{
+		"descending_breakout": {Months: 36},
+		"breakout_caution":    {Months: 12},
+	}}
+
+	if err := applyScanOverrides(cfg, 18); err != nil {
+		t.Fatalf("applyScanOverrides returned error: %v", err)
+	}
+	if got := cfg.Screeners["descending_breakout"].Months; got != 18 {
+		t.Fatalf("descending_breakout months = %d, want 18", got)
+	}
+	if got := cfg.Screeners["breakout_caution"].Months; got != 12 {
+		t.Fatalf("unrelated screener months = %d, want unchanged 12", got)
+	}
+}
+
+func TestApplyScanOverridesRejectsUnsafeMonths(t *testing.T) {
+	cfg := &config.Config{Screeners: map[string]config.ScreenerConfig{}}
+	for _, months := range []int{-1, 1} {
+		if err := applyScanOverrides(cfg, months); err == nil {
+			t.Fatalf("months=%d accepted, want validation error", months)
+		}
+	}
+	if err := applyScanOverrides(cfg, 0); err != nil {
+		t.Fatalf("months=0 should preserve configured value: %v", err)
+	}
+}
+
+func TestValidateScanOptionsRejectsInvalidFiltersAndSort(t *testing.T) {
+	tests := []struct {
+		name                         string
+		minScore, minPrice, minValue float64
+		sort                         string
+	}{
+		{"score above one", 1.1, 0, 0, "score"},
+		{"negative score", -0.1, 0, 0, "score"},
+		{"negative price", 0.5, -1, 0, "score"},
+		{"negative traded value", 0.5, 0, -1, "score"},
+		{"unknown sort", 0.5, 0, 0, "volume"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateScanOptions(tt.minScore, tt.minPrice, tt.minValue, tt.sort); err == nil {
+				t.Fatal("validateScanOptions accepted invalid input")
+			}
+		})
+	}
+	if err := validateScanOptions(0, 0, 0, "filters"); err != nil {
+		t.Fatalf("valid options rejected: %v", err)
+	}
+}
 
 func TestEffectiveMinPrice(t *testing.T) {
 	tests := []struct {

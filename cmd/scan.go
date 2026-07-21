@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/rohitsharma04/stockctl/internal/config"
 	"github.com/rohitsharma04/stockctl/internal/indicators"
 	"github.com/rohitsharma04/stockctl/internal/marketdata"
 	"github.com/rohitsharma04/stockctl/internal/output"
@@ -118,6 +120,12 @@ func runScan(cmd *cobra.Command, args []string) error {
 	strategy := args[0]
 	ctx := rootCtx
 	startTime := time.Now()
+	if err := validateScanOptions(minScore, minPrice, minTradedValue, sortBy); err != nil {
+		return err
+	}
+	if err := applyScanOverrides(appConfig, months); err != nil {
+		return err
+	}
 
 	// Parse --date for historical analysis
 	var asOfDate time.Time
@@ -355,6 +363,46 @@ func runScan(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// applyScanOverrides applies CLI-only screener configuration without mutating
+// unrelated strategies. A descending triangle needs at least two monthly bars:
+// the implementation compares the final close with the prior month high.
+func applyScanOverrides(cfg *config.Config, months int) error {
+	if months == 0 {
+		return nil
+	}
+	if months < 2 {
+		return fmt.Errorf("--months must be at least 2")
+	}
+	if cfg == nil {
+		return errors.New("scan configuration is not initialized")
+	}
+	if cfg.Screeners == nil {
+		cfg.Screeners = make(map[string]config.ScreenerConfig)
+	}
+	descending := cfg.Screeners["descending_breakout"]
+	descending.Months = months
+	cfg.Screeners["descending_breakout"] = descending
+	return nil
+}
+
+func validateScanOptions(minScore, minPrice, minTradedValue float64, sortBy string) error {
+	if math.IsNaN(minScore) || math.IsInf(minScore, 0) || minScore < 0 || minScore > 1 {
+		return fmt.Errorf("--min-score must be between 0 and 1")
+	}
+	if math.IsNaN(minPrice) || math.IsInf(minPrice, 0) || minPrice < 0 {
+		return fmt.Errorf("--min-price must be a non-negative finite number")
+	}
+	if math.IsNaN(minTradedValue) || math.IsInf(minTradedValue, 0) || minTradedValue < 0 {
+		return fmt.Errorf("--min-traded-value must be a non-negative finite number")
+	}
+	switch sortBy {
+	case "score", "ticker", "filters":
+		return nil
+	default:
+		return fmt.Errorf("unsupported --sort %q (allowed: score, ticker, filters)", sortBy)
+	}
 }
 
 // tickerScanData holds per-ticker metadata collected during screening.
