@@ -4,7 +4,7 @@
 
 **Goal:** Make large `stockctl` scans safe against Yahoo Finance throttling by maintaining a resumable weekly historical-data seed and serving on-demand scans from cached history plus a bounded delta only.
 
-**Architecture:** Treat the local cache as the authoritative working store. A weekly no-agent seeder fills historical gaps slowly and resumably; on-demand scans first read cached bars, request only the missing tail with a small overlap, merge/dedupe atomically, and expose provenance/staleness in JSON. A scan fetches each symbol once into a per-run snapshot, then executes all selected strategies against that snapshot.
+**Architecture:** Treat the local cache as the authoritative working store. **Hermes owns the weekly seed orchestration**: its no-agent script owns scheduling, batch selection, checkpoints, retry timing, rate limiting, resumability, alerts, and run history; `stockctl` remains the data/cache engine. On-demand scans first read cached bars, request only the missing tail with a small overlap, merge/dedupe atomically, and expose provenance/staleness in JSON. A scan fetches each symbol once into a per-run snapshot, then executes all selected strategies against that snapshot.
 
 **Tech stack:** Go, existing `oscarli916/yahoo-finance-api` provider, disk cache in `internal/marketdata/diskcache.go`, `golang.org/x/time/rate`, Cobra, Go tests, Hermes cron (no-agent scripts).
 
@@ -14,7 +14,7 @@
 
 1. **Never call Yahoo once per strategy.** One symbol/benchmark fetch maximum per run, regardless of `scan all`.
 2. **On demand reads cache first.** It may fetch only the missing daily-bar delta after the last stored bar; request a 5-trading-day overlap for corrections/splits, then merge by timestamp.
-3. **The weekly seed may run slowly.** It is no-agent, resumable, rate limited conservatively, and may take several hours over a weekend.
+3. **Hermes owns weekly seeding.** Its no-agent orchestration script is resumable, rate limited conservatively, and may run for several hours over a weekend; `stockctl` only performs cache-aware batch scans.
 4. **A provider error must never masquerade as fresh data.** Cache age, last-bar date, stale fallback, upstream error, and coverage must appear in the JSON envelope.
 5. **Retry budgets are bounded by an overall deadline.** Respect `Retry-After` if available; use exponential backoff + full jitter for 429, 5xx, and transient network errors.
 6. **No concurrent writers.** Lock cache mutation across all CLI and seeder processes.
@@ -27,7 +27,7 @@
 | MD-01 | P0 | Cache/provenance contract and atomic process lock | — |
 | MD-02 | P0 | Delta-only fetch + merge/dedupe | MD-01 |
 | MD-03 | P0 | One fetch snapshot shared by all scan strategies | MD-02 |
-| MD-04 | P0 | Weekend seed command with checkpoint/resume | MD-01, MD-02 |
+| MD-04 | P0 | Hermes-managed weekend seed with checkpoint/resume | MD-01, MD-02 |
 | MD-05 | P1 | Retry/backoff, context cancellation, correct circuit-breaker probing | MD-01 |
 | MD-06 | P1 | Truthful JSON data-health and quality gates | MD-01–03 |
 | MD-07 | P1 | Market policy: price floors and exchange data-as-of semantics | MD-06 |
@@ -111,39 +111,32 @@
 
 ---
 
-## MD-04 — Resumable weekend historical seeder
+## MD-04 — Hermes-managed weekend historical seed
 
-**Objective:** Provide a slow, reliable no-agent command that can seed/refill all markets over several hours.
+**Objective:** Hermes, not the Go CLI, owns the multi-hour weekend workflow: scheduling, batch queue, checkpoints, backoff timing, resumption, and alerting. `stockctl` is invoked only as the cache-aware batch data engine.
 
 **Files:**
-- Create: `cmd/seed.go`
-- Modify: `cmd/root.go`
-- Modify: `internal/config/config.go`
-- Create: `internal/marketdata/seed_state.go`
-- Create: `cmd/seed_test.go`
 - Create: `automation/stockctl_weekend_seed.py`
+- Create: `~/.hermes/profiles/rohit/scripts/stockctl_weekend_seed.py` (thin profile wrapper)
+- Create: `automation/tests/test_weekend_seed.py`
+- Modify: `README.md`
+- Modify: `docs/operations/yahoo-data-runbook.md` (created in MD-08)
 
-**CLI contract:**
-```bash
-stockctl seed history --market india --market us \
-  --start 2021-01-01 --workers 1 --rate 1.0 \
-  --retry-budget 6 --deadline 6h --output json --quiet
-```
-
-**Implementation:**
-- Persist checkpoint state per `(market, ticker)`: completed, pending, retry-at, last error, and latest cached bar. Use atomic writes.
-- Process small batches; checkpoint after every successful merge and after each retryable failure.
-- Retry transient failures with full-jitter exponential backoff. Treat non-retryable symbol errors as terminal and include them in output.
-- Default to **one worker and one request/second** for a cold seed. Make rate/worker overrides explicit and bounded.
-- If interrupted, the next invocation resumes pending/retryable work without revisiting successfully seeded symbols.
+**Hermes workflow contract:**
+1. Read each embedded universe using `bin/stockctl tickers --market <market> --output json --quiet`.
+2. Persist state at `~/.hermes/profiles/rohit/state/stockctl-weekend-seed.json`: per market, ticker batch, attempt count, next eligible retry, and last successful bar date.
+3. Create small temporary CSV batches (for example 20 symbols) and call `bin/stockctl scan breakout-caution --market <market> --tickers <batch.csv> --workers 1 --output json --quiet`. After MD-02, each invocation reads cache and fetches only a delta for missing bars.
+4. Rate-limit batch launches to one request/second-equivalent, with no concurrent stockctl processes. The Hermes script, not an LLM, implements full-jitter retries and a six-hour wall-clock deadline.
+5. Checkpoint atomically after every successful batch and retryable failure. On interruption or the next weekly tick, resume only unfinished/eligible batches.
+6. Emit **no stdout on success**. On deadline exhaustion or a persistent failure threshold, emit one compact Telegram-ready alert. No agent/LLM is involved.
 
 **Tests (TDD):**
-1. A seed resumes from persisted state and skips completed symbols.
-2. A 429 schedules a retry after `Retry-After` (or jittered delay fallback) without losing progress.
-3. A cancellation persists a checkpoint before exit.
-4. Re-running a completed seed only checks deltas, not historical ranges.
+1. A completed batch in the persisted state is not invoked again after restart.
+2. A simulated 429 moves its batch to a future retry time and does not block unrelated eligible batches.
+3. A cancellation/deadline persists state before exit.
+4. The wrapper exits silently outside its scheduled window and returns its canonical script's exit status.
 
-**Acceptance:** an interrupted seed can resume; a full India+US seed can run for hours without an uncontrolled burst or duplicate historical downloads.
+**Acceptance:** Hermes can resume an interrupted India+US weekly seed across weekends without an uncontrolled burst or duplicate historical downloads. No `stockctl seed` command is required.
 
 ---
 
@@ -223,9 +216,9 @@ stockctl seed history --market india --market us \
 - Create: `docs/operations/yahoo-data-runbook.md`
 
 **Weekend job design:**
-- Hermes no-agent cron, **Sunday 03:00 IST** with a six-hour deadline.
-- It runs `stockctl seed history --market india --market us` with the conservative defaults.
-- Stdout is silent on success; errors write a compact failure summary. No LLM is used.
+- Hermes no-agent cron, **Sunday 03:00 IST** with a six-hour script timeout and a thin profile wrapper.
+- It runs the Hermes-owned `automation/stockctl_weekend_seed.py` coordinator, which invokes small, single-worker `stockctl scan` batches and persists state under the active Hermes profile.
+- Stdout is silent on success; the coordinator emits one compact failure summary only when its deadline or failure threshold is exhausted. No LLM is used.
 - Morning scans only request a delta after the cache’s last bar; they should be near-zero Yahoo traffic before a new completed session exists.
 
 **Acceptance:** CI executes `go test ./...`, a clean checkout compiles embedded data, and the runbook documents resume/reset/inspection commands.
