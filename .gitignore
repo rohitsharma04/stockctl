@@ -15,9 +15,14 @@ stockctl
 .DS_Store
 Thumbs.db
 
-# Data files (but NOT embedded universes)
+# Data files (but NOT embedded data required by go:embed)
 *.csv
 !internal/marketdata/data/universes/*.csv
+!internal/marketdata/data/india_sectors.csv
+!internal/marketdata/data/us_sectors.csv
+
+# Local Python automation environment
+.venv/
 
 # Config with credentials (keep config.toml as template)
 # config.local.toml

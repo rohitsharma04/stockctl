@@ -59,6 +59,37 @@ stockctl backtest --input signals.csv --tp-range 0.10:0.30 --sl-range 0.02:0.05
 stockctl markets
 ```
 
+## Automated morning briefs
+
+`automation/market_morning_brief.py` is designed for a scheduler: it checks the
+actual NSE/NYSE trading calendar, holds a process-wide lock so there is never more
+than one `stockctl` process, runs a **single** rate-limited scan (`--workers 2`),
+and calls Hermes only after the quality gate passes to turn the result into the
+final Telegram update.
+
+```bash
+# One-time setup
+python3.11 -m venv .venv
+.venv/bin/pip install -r requirements-market-brief.txt
+go build -o bin/stockctl .
+
+# Exercise a collector without calling the final agent
+STOCKCTL_BRIEF_FORCE_MARKET=india STOCKCTL_BRIEF_DRY_RUN=1 \
+  .venv/bin/python automation/market_morning_brief.py
+```
+
+Normal scheduled behavior:
+
+| Market | Trigger | Calendar guard |
+|---|---:|---|
+| India / NSE | 08:30 IST | NSE trading session |
+| US / NYSE | 08:00 America/New_York (30 minutes before the regular open) | NYSE trading session + DST-aware local time |
+
+The automation stores raw scan JSON and the compact agent input under
+`/tmp/stockctl/market-briefs/`. It rejects a scan with a missing benchmark, fewer
+than 400 scanned symbols, or excessive fetch failures; in that case it sends
+nothing rather than publishing a misleading update.
+
 ## Markets
 
 19 exchanges supported — US, India (NSE/BSE), Japan, UK, Germany, France, Canada, Australia, Hong Kong, China, South Korea, Singapore, Brazil, Taiwan, Italy, Spain, Sweden, Switzerland.
@@ -99,6 +130,7 @@ internal/
   pairs/        Correlation, hedge ratio, trading simulator
   backtest/     Parallel TP/SL grid search
   output/       Table, JSON, CSV formatters
+automation/     Calendar-aware no-agent market collector
 config.toml     Default configuration template
 .agent/         AI agent skill + workflow definitions
 ```
