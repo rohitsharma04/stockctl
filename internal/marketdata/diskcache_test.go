@@ -476,8 +476,8 @@ func TestDiskCache_AsOfMaxNeverClaimsFullHistoricalCoverage(t *testing.T) {
 	if len(mock.calls) != 1 {
 		t.Fatalf("max AsOf cache should not be treated as complete, got %d upstream calls", len(mock.calls))
 	}
-	if mock.calls[0].period != "5y" {
-		t.Fatalf("daily max AsOf backfill period = %q, want 5y", mock.calls[0].period)
+	if mock.calls[0].period != "max" {
+		t.Fatalf("daily max AsOf backfill period = %q, want max", mock.calls[0].period)
 	}
 	if result.Provenance.Source != HistorySourceCacheAndUpstream {
 		t.Fatalf("source = %q, want %q", result.Provenance.Source, HistorySourceCacheAndUpstream)
@@ -487,7 +487,7 @@ func TestDiskCache_AsOfMaxNeverClaimsFullHistoricalCoverage(t *testing.T) {
 	}
 }
 
-func TestDiskCache_FirstDailyHistoryPopulationFetchesFiveYears(t *testing.T) {
+func TestDiskCache_FirstDailyHistoryPopulationFetchesRequestedPeriod(t *testing.T) {
 	tmpDir := t.TempDir()
 	mock := &recordingProvider{
 		data: []OHLCV{{Date: time.Date(2025, 3, 28, 0, 0, 0, 0, time.UTC), Close: 128}},

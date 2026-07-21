@@ -100,6 +100,7 @@ Hermes should only schedule one long-running process and report a terminal failu
 go build -o bin/stockctl .
 bin/stockctl --quiet seed history \
   --market india --market us \
+  --period max \
   --rate 1 --workers 1 --max-attempts 3 --deadline 6h \
   --state-file ~/.stockctl/seed-history-state.json
 ```
@@ -107,7 +108,9 @@ bin/stockctl --quiet seed history \
 The command is sequential by design (`--workers 1`) to protect Yahoo rate limits.
 It emits a single JSON summary to stdout. A nonzero exit means there are terminal
 failures or work still pending after the deadline; rerun the same command to resume
-without re-fetching successful tickers. See
+without re-fetching successful tickers for the same history period and coverage
+intent. Checkpoints record both; changing from the legacy implicit `5y` seed to
+`--period max` resets ticker work so full-history downloads are not skipped. See
 [`docs/operations/yahoo-data-runbook.md`](docs/operations/yahoo-data-runbook.md)
 for checkpoint inspection, recovery, and the Hermes-launcher contract.
 

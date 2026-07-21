@@ -21,11 +21,17 @@ Use a dedicated state file if you want an explicit run boundary. Re-running the 
 ```bash
 bin/stockctl --quiet seed history \
   --market india --market us \
+  --period max \
   --rate 1 --workers 1 --max-attempts 3 --deadline 6h \
   --state-file ~/.stockctl/seed-history-state.json
 ```
 
 Exit status is non-zero when any ticker is terminally failed or remains pending at the deadline. Stdout is one JSON summary; progress and CLI usage are suppressed in quiet mode.
+
+The checkpoint stores the requested history period and coverage identity. Version 1
+and version 2 checkpoints are treated as incompatible legacy checkpoints; the
+first `--period max` run upgrades the checkpoint to version 3 and resets ticker
+work so old successes do not hide missing full-history cache entries.
 
 ## Inspect checkpoint state
 
@@ -38,7 +44,7 @@ s = json.loads(p.read_text())
 counts = {}
 for item in s['tickers'].values():
     counts[item['status']] = counts.get(item['status'], 0) + 1
-print({'updated_at': s.get('updated_at'), 'markets': s.get('markets'), 'counts': counts})
+print({'updated_at': s.get('updated_at'), 'markets': s.get('markets'), 'period': s.get('period'), 'counts': counts})
 PY
 ```
 
@@ -71,7 +77,7 @@ The versioned launcher is intentionally policy-free:
 
 ```bash
 python3 automation/stockctl_weekend_seed.py \
-  --market india --market us --rate 1 --workers 1 --max-attempts 3 --deadline 6h --quiet
+  --market india --market us --period max --rate 1 --workers 1 --max-attempts 3 --deadline 6h --quiet
 ```
 
 It resolves `STOCKCTL_BIN`, then `bin/stockctl`, then `go run .`, and uses `exec` so exit status and stdout are unchanged.

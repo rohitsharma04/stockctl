@@ -300,6 +300,12 @@ func sameHistoryDay(a, b time.Time) bool {
 }
 
 func initialFetchPeriod(period, interval string) string {
+	// A full-history seed must not be silently narrowed. Normal daily cache
+	// population remains bounded to five years so interactive cold-cache scans do
+	// not turn into unexpectedly expensive all-history requests.
+	if period == "max" {
+		return "max"
+	}
 	if interval == "1d" {
 		return "5y"
 	}

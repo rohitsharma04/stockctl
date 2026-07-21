@@ -19,6 +19,7 @@ import (
 type seedTestProvider struct {
 	mu          sync.Mutex
 	calls       map[string]int
+	periods     map[string][]string
 	order       []string
 	err         error
 	blockOnCall int
@@ -27,6 +28,9 @@ type seedTestProvider struct {
 func (p *seedTestProvider) GetHistory(ctx context.Context, symbol, period, interval string) ([]marketdata.OHLCV, error) {
 	p.mu.Lock()
 	p.calls[symbol]++
+	if p.periods != nil {
+		p.periods[symbol] = append(p.periods[symbol], period)
+	}
 	p.order = append(p.order, symbol)
 	call := len(p.order)
 	p.mu.Unlock()
@@ -38,6 +42,94 @@ func (p *seedTestProvider) GetHistory(ctx context.Context, symbol, period, inter
 		return nil, err
 	}
 	return nil, p.err
+}
+
+func TestSeedHistoryDefaultPeriodMaxPassesThroughToHistoryProvider(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	provider := &seedTestProvider{calls: map[string]int{}, periods: map[string][]string{}}
+	summary, stderr, err := executeSeedHistoryForTest(t, provider, "--market", "us", "--state-file", stateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want quiet command output", stderr)
+	}
+	if summary.Period != "max" || summary.Coverage != seedHistoryCoverage {
+		t.Fatalf("summary identity = %q/%q, want max/%q", summary.Period, summary.Coverage, seedHistoryCoverage)
+	}
+	tickers, _ := seedTickers([]string{"us"})
+	if summary.Succeeded != len(tickers) {
+		t.Fatalf("summary = %#v, want all tickers successful", summary)
+	}
+	state, err := loadSeedCheckpoint(stateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Version != seedStateVersion || state.Period != "max" || state.Coverage != seedHistoryCoverage {
+		t.Fatalf("checkpoint identity = %d/%q/%q, want %d/max/%q", state.Version, state.Period, state.Coverage, seedStateVersion, seedHistoryCoverage)
+	}
+	for _, ticker := range tickers {
+		if got := provider.periods[ticker]; len(got) != 1 || got[0] != "max" {
+			t.Fatalf("periods[%s] = %#v, want [max]", ticker, got)
+		}
+	}
+}
+
+func TestSeedHistoryExplicitPeriodPassesThroughToProvider(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	provider := &seedTestProvider{calls: map[string]int{}, periods: map[string][]string{}}
+	_, _, err := executeSeedHistoryForTest(t, provider, "--market", "us", "--state-file", stateFile, "--period", "10y")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for ticker, periods := range provider.periods {
+		if len(periods) != 1 || periods[0] != "10y" {
+			t.Fatalf("periods[%s] = %#v, want [10y]", ticker, periods)
+		}
+	}
+}
+
+func TestSeedHistoryPeriodMaxUpgradesLegacyCheckpointAndRefetchesOldSuccesses(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	tickers, _ := seedTickers([]string{"india"})
+	now := time.Now().UTC()
+	legacy := &seedCheckpoint{Version: 1, Markets: []string{"india"}, Tickers: map[string]*seedTickerState{}}
+	for _, ticker := range tickers {
+		legacy.Tickers[ticker] = &seedTickerState{Status: "success", Attempts: 1, CreatedAt: now, UpdatedAt: now}
+	}
+	if err := saveSeedCheckpoint(stateFile, legacy); err != nil {
+		t.Fatal(err)
+	}
+
+	provider := &seedTestProvider{calls: map[string]int{}, periods: map[string][]string{}}
+	summary, stderr, err := executeSeedHistoryForTest(t, provider, "--market", "india", "--state-file", stateFile, "--period", "max")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want quiet command output", stderr)
+	}
+	if summary.Succeeded != len(tickers) || summary.Pending != 0 || summary.Failed != 0 {
+		t.Fatalf("summary = %#v, want completed max seed", summary)
+	}
+	if len(provider.calls) != len(tickers) {
+		t.Fatalf("legacy successes were skipped: got %d calls, want %d", len(provider.calls), len(tickers))
+	}
+	for _, ticker := range tickers {
+		if provider.calls[ticker] != 1 {
+			t.Fatalf("calls[%s] = %d, want legacy success refetched for max", ticker, provider.calls[ticker])
+		}
+		if got := provider.periods[ticker]; len(got) != 1 || got[0] != "max" {
+			t.Fatalf("periods[%s] = %#v, want [max]", ticker, got)
+		}
+	}
+	state, err := loadSeedCheckpoint(stateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Version != seedStateVersion || state.Period != "max" || state.Coverage != seedHistoryCoverage {
+		t.Fatalf("checkpoint identity = %d/%q/%q, want %d/max/%q", state.Version, state.Period, state.Coverage, seedStateVersion, seedHistoryCoverage)
+	}
 }
 func (p *seedTestProvider) GetQuote(context.Context, string) (*marketdata.Quote, error) {
 	return nil, nil
@@ -106,7 +198,7 @@ func TestSeedHistoryResumeSkipsSuccesses(t *testing.T) {
 	stateFile := filepath.Join(t.TempDir(), "state.json")
 	tickers, _ := seedTickers([]string{"india"})
 	now := time.Now().UTC()
-	state := &seedCheckpoint{Version: seedStateVersion, Markets: []string{"india"}, Tickers: map[string]*seedTickerState{}}
+	state := &seedCheckpoint{Version: seedStateVersion, Period: "max", Coverage: seedHistoryCoverage, Markets: []string{"india"}, Tickers: map[string]*seedTickerState{}}
 	for _, ticker := range tickers {
 		state.Tickers[ticker] = &seedTickerState{Status: "success", Attempts: 1, CreatedAt: now, UpdatedAt: now}
 	}
@@ -239,7 +331,7 @@ func TestSeedHistoryFutureRetryStaysPendingWithoutUpstreamCall(t *testing.T) {
 	stateFile := filepath.Join(t.TempDir(), "state.json")
 	tickers, _ := seedTickers([]string{"india"})
 	now := time.Now().UTC()
-	state := &seedCheckpoint{Version: seedStateVersion, Markets: []string{"india"}, Tickers: map[string]*seedTickerState{}}
+	state := &seedCheckpoint{Version: seedStateVersion, Period: "max", Coverage: seedHistoryCoverage, Markets: []string{"india"}, Tickers: map[string]*seedTickerState{}}
 	for _, ticker := range tickers {
 		state.Tickers[ticker] = &seedTickerState{Status: "success", Attempts: 1, CreatedAt: now, UpdatedAt: now}
 	}
@@ -271,7 +363,7 @@ func TestSeedHistoryTransientClassificationAndContextErrors(t *testing.T) {
 	defer cancel()
 	<-ctx.Done()
 	provider := &seedTestProvider{calls: map[string]int{}}
-	if err := seedGetHistory(ctx, provider, "X", &seedSummary{}); !errors.Is(err, context.DeadlineExceeded) {
+	if err := seedGetHistory(ctx, provider, "X", "5y", &seedSummary{}); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("context error = %v", err)
 	}
 }

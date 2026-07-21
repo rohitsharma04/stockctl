@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""stockctl weekend seed launcher, version 1.
+"""stockctl weekend seed launcher, version 2.
 
 This intentionally contains no seed, retry, cache, or scheduling policy. Those
 belong to stockctl; this wrapper only replaces itself with the requested CLI.
+Pass stockctl seed flags directly, including --period max for full-history seeds.
 """
 from __future__ import annotations
 

@@ -17,7 +17,14 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const seedStateVersion = 1
+const seedStateVersion = 3
+const legacySeedHistoryPeriod = "5y"
+const defaultSeedHistoryPeriod = "max"
+
+// seedHistoryCoverage identifies the semantic promise of a completed seed,
+// rather than merely the Yahoo period spelling. Bump it when that promise
+// changes so old successes are never reused for a broader request.
+const seedHistoryCoverage = "yahoo-daily-all-available-v1"
 
 type seedTickerState struct {
 	Status    string    `json:"status"`
@@ -29,16 +36,20 @@ type seedTickerState struct {
 }
 
 type seedCheckpoint struct {
-	Version int                         `json:"version"`
-	Markets []string                    `json:"markets"`
-	Tickers map[string]*seedTickerState `json:"tickers"`
-	Updated time.Time                   `json:"updated_at"`
+	Version  int                         `json:"version"`
+	Period   string                      `json:"period"`
+	Coverage string                      `json:"coverage"`
+	Markets  []string                    `json:"markets"`
+	Tickers  map[string]*seedTickerState `json:"tickers"`
+	Updated  time.Time                   `json:"updated_at"`
 }
 
 type seedSummary struct {
 	Started   time.Time `json:"started"`
 	Finished  time.Time `json:"finished"`
 	Markets   []string  `json:"markets"`
+	Period    string    `json:"requested_period"`
+	Coverage  string    `json:"coverage_intent"`
 	Total     int       `json:"total"`
 	Succeeded int       `json:"succeeded"`
 	Failed    int       `json:"failed"`
@@ -63,11 +74,11 @@ func newSeedCmd() *cobra.Command {
 
 func newSeedHistoryCmd() *cobra.Command {
 	var markets []string
-	var stateFile, deadline string
+	var stateFile, deadline, period string
 	var rate, workers, maxAttempts int
 	cmd := &cobra.Command{
 		Use:           "history",
-		Short:         "Seed five years of daily history into the local cache",
+		Short:         "Seed daily history into the local cache",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -79,6 +90,9 @@ func newSeedHistoryCmd() *cobra.Command {
 			}
 			if rate <= 0 || maxAttempts < 1 {
 				return errors.New("--rate and --max-attempts must be positive")
+			}
+			if !isSupportedSeedPeriod(period) {
+				return fmt.Errorf("unsupported --period %q (allowed: 5y, 10y, max)", period)
 			}
 			for _, market := range markets {
 				if market != "india" && market != "us" {
@@ -107,12 +121,13 @@ func newSeedHistoryCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			now := time.Now().UTC()
+			reconcileSeedCheckpointCoverage(checkpoint, period, seedCoverageIntent(period), now)
 			checkpoint.Markets = markets
 			tickers, err := seedTickers(markets)
 			if err != nil {
 				return err
 			}
-			now := time.Now().UTC()
 			for _, ticker := range tickers {
 				if checkpoint.Tickers[ticker] == nil {
 					checkpoint.Tickers[ticker] = &seedTickerState{Status: "pending", CreatedAt: now, UpdatedAt: now}
@@ -122,7 +137,7 @@ func newSeedHistoryCmd() *cobra.Command {
 				return err
 			}
 			provider := seedProviderFactory(noCache, rate)
-			summary := seedSummary{Started: now, Markets: markets, Total: len(tickers)}
+			summary := seedSummary{Started: now, Markets: markets, Period: period, Coverage: seedCoverageIntent(period), Total: len(tickers)}
 			interrupted := false
 			for _, ticker := range tickers {
 				if interrupted {
@@ -146,7 +161,7 @@ func newSeedHistoryCmd() *cobra.Command {
 					}
 					st.Attempts++
 					st.UpdatedAt = time.Now().UTC()
-					err := seedGetHistory(ctx, provider, ticker, &summary)
+					err := seedGetHistory(ctx, provider, ticker, period, &summary)
 					if err == nil {
 						st.Status, st.LastError, st.NextRetry = "success", "", time.Time{}
 						st.UpdatedAt = time.Now().UTC()
@@ -213,15 +228,16 @@ func newSeedHistoryCmd() *cobra.Command {
 	cmd.Flags().StringSliceVar(&markets, "market", nil, "market to seed (repeatable: india, us; required)")
 	cmd.Flags().StringVar(&stateFile, "state-file", "", "checkpoint JSON file")
 	cmd.Flags().StringVar(&deadline, "deadline", "", "overall seed deadline (for example 30m)")
+	cmd.Flags().StringVar(&period, "period", defaultSeedHistoryPeriod, "Yahoo daily history period to seed (default max: all available daily history)")
 	cmd.Flags().IntVar(&rate, "rate", 5, "maximum upstream requests per second")
 	cmd.Flags().IntVar(&workers, "workers", 1, "workers (only 1 is currently supported)")
 	cmd.Flags().IntVar(&maxAttempts, "max-attempts", 3, "maximum attempts per ticker")
 	return cmd
 }
 
-func seedGetHistory(ctx context.Context, provider marketdata.Provider, ticker string, summary *seedSummary) error {
+func seedGetHistory(ctx context.Context, provider marketdata.Provider, ticker, period string, summary *seedSummary) error {
 	if hp, ok := provider.(marketdata.HistoryProvider); ok {
-		result, err := hp.GetHistoryWithProvenance(ctx, marketdata.HistoryRequest{Symbol: ticker, Period: "5y", Interval: "1d"})
+		result, err := hp.GetHistoryWithProvenance(ctx, marketdata.HistoryRequest{Symbol: ticker, Period: period, Interval: "1d"})
 		if err == nil {
 			switch result.Provenance.Source {
 			case marketdata.HistorySourceCache:
@@ -235,7 +251,7 @@ func seedGetHistory(ctx context.Context, provider marketdata.Provider, ticker st
 		}
 		return err
 	}
-	_, err := provider.GetHistory(ctx, ticker, "5y", "1d")
+	_, err := provider.GetHistory(ctx, ticker, period, "1d")
 	return err
 }
 
@@ -278,10 +294,36 @@ func loadSeedCheckpoint(path string) (*seedCheckpoint, error) {
 	if state.Tickers == nil {
 		state.Tickers = map[string]*seedTickerState{}
 	}
-	if state.Version != seedStateVersion {
+	switch state.Version {
+	case 1:
+		state.Version = seedStateVersion
+		state.Period = legacySeedHistoryPeriod
+	case 2:
+		// Version 2 recorded a period but no coverage promise. Treat it as
+		// incompatible so a newly stronger seed can never skip old successes.
+		state.Version = seedStateVersion
+	case seedStateVersion:
+	default:
 		return nil, fmt.Errorf("unsupported seed state version %d", state.Version)
 	}
 	return state, nil
+}
+
+func seedCoverageIntent(period string) string {
+	if period == "max" {
+		return seedHistoryCoverage
+	}
+	return "yahoo-daily-period-" + period + "-v1"
+}
+
+func reconcileSeedCheckpointCoverage(state *seedCheckpoint, period, coverage string, now time.Time) {
+	if state.Period == period && state.Coverage == coverage {
+		return
+	}
+	state.Period = period
+	state.Coverage = coverage
+	state.Tickers = map[string]*seedTickerState{}
+	state.Updated = now
 }
 
 func saveSeedCheckpoint(path string, state *seedCheckpoint) error {
@@ -338,6 +380,14 @@ func isTransientSeedError(err error) bool {
 	type temporary interface{ Temporary() bool }
 	var t temporary
 	return errors.As(err, &t) && t.Temporary()
+}
+func isSupportedSeedPeriod(period string) bool {
+	switch period {
+	case "5y", "10y", "max":
+		return true
+	default:
+		return false
+	}
 }
 func uniqueStrings(in []string) []string {
 	seen := map[string]bool{}
