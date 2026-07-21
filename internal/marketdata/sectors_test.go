@@ -63,3 +63,20 @@ func TestEmbeddedSectorMappingsExactlyCoverUniverses(t *testing.T) {
 		})
 	}
 }
+
+func TestEmbeddedIndiaUniverseHasCurrentNifty500Cardinality(t *testing.T) {
+	universe, err := GetUniverse("india")
+	if err != nil {
+		t.Fatalf("GetUniverse(India): %v", err)
+	}
+	unique := make(map[string]struct{}, len(universe))
+	for _, symbol := range universe {
+		if _, exists := unique[symbol]; exists {
+			t.Fatalf("embedded India universe contains duplicate symbol %q", symbol)
+		}
+		unique[symbol] = struct{}{}
+	}
+	if len(universe) != 500 {
+		t.Fatalf("embedded India universe has %d symbols, want 500", len(universe))
+	}
+}

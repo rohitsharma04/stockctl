@@ -3,15 +3,17 @@
 
 Usage (from the repository root):
     python3 scripts/generate_sector_mappings.py
+    python3 scripts/generate_sector_mappings.py --refresh-india-universe
 
 Inputs (downloaded with a bounded 60-second timeout):
 * India: NSE Indices' official Nifty 500 constituent CSV:
   https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv
   Its ``Industry`` column is copied verbatim; sector is only a documented,
-  deterministic broad grouping of that official industry.  The embedded India
-  universe is pinned (rather than silently changed when Nifty rebalances), so
-  NIFTY500_MARCH_2026_INDUSTRY preserves the official Industry values for its
-  former constituents, from the official list captured on 2026-03-26.
+  deterministic broad grouping of that official industry. The normal command
+  regenerates mappings for the embedded universes. --refresh-india-universe is
+  the explicit opt-in command that replaces only the embedded India universe
+  with the current official 500-symbol constituent list, then maps that exact
+  list. It does not write the US universe or US sector mapping.
 * US: Wikipedia's S&P 500 constituents table (GICS Sector and GICS
   Sub-Industry), a table which cites S&P Dow Jones Indices as its source:
   https://en.wikipedia.org/wiki/List_of_S%26P_500_companies
@@ -27,6 +29,7 @@ coverage and non-empty Sector and Industry fields.
 """
 from __future__ import annotations
 
+import argparse
 import csv
 import io
 import sys
@@ -44,24 +47,6 @@ SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 SP500_2025_12_23_URL = (
     "https://en.wikipedia.org/w/index.php?title=List_of_S%26P_500_companies&oldid=1329075976"
 )
-
-# Official Nifty 500 Industry values for symbols present in the repository's
-# 2026-03-26 pinned universe but no longer in the live constituent CSV.
-NIFTY500_MARCH_2026_INDUSTRY = {
-    "AGARWALEYE": "Consumer Durables", "AKUMS": "Healthcare", "AKZOINDIA": "Chemicals",
-    "ALKYLAMINE": "Chemicals", "ALOKINDS": "Textiles", "APLLTD": "Healthcare",
-    "ASTRAZEN": "Healthcare", "BASF": "Chemicals", "CAMPUS": "Consumer Durables",
-    "CENTURYPLY": "Construction Materials", "CERA": "Consumer Durables", "DBREALTY": "Realty",
-    "FINPIPE": "Capital Goods", "GODREJAGRO": "Fast Moving Consumer Goods",
-    "GSPL": "Oil Gas & Consumable Fuels", "GUJGASLTD": "Oil Gas & Consumable Fuels",
-    "HAPPSTMNDS": "Information Technology", "INOXINDIA": "Capital Goods",
-    "JBCHEPHARM": "Healthcare", "JYOTHYLAB": "Fast Moving Consumer Goods",
-    "KIRLOSBROS": "Capital Goods", "KSB": "Capital Goods", "MAHSCOOTER": "Automobile and Auto Components",
-    "MAHSEAMLES": "Metals & Mining", "MANYAVAR": "Consumer Durables", "METROPOLIS": "Healthcare",
-    "PGHH": "Fast Moving Consumer Goods", "PRAJIND": "Capital Goods", "RCF": "Chemicals",
-    "RELINFRA": "Power", "SUNDRMFAST": "Automobile and Auto Components", "TRIVENI": "Diversified",
-    "VENTIVE": "Consumer Services", "VGUARD": "Consumer Durables",
-}
 
 # Broad sectors are deterministic taxonomy labels, not company classifications.
 INDIA_SECTOR_BY_INDUSTRY = {
@@ -85,6 +70,34 @@ def download(url: str) -> str:
 def universe(market: str) -> set[str]:
     with (UNIVERSES / f"{market}.csv").open(newline="", encoding="utf-8") as f:
         return {row["Symbol"].strip() for row in csv.DictReader(f) if row["Symbol"].strip()}
+
+
+def official_india_constituents(csv_text: str) -> list[tuple[str, str]]:
+    """Return ordered official Nifty 500 symbols and industries, validating the list."""
+    rows = []
+    seen = set()
+    for row in csv.DictReader(io.StringIO(csv_text)):
+        symbol = row["Symbol"].strip()
+        industry = row["Industry"].strip()
+        if not symbol or not industry:
+            raise RuntimeError("Nifty 500 source contains an empty Symbol or Industry")
+        if symbol in seen:
+            raise RuntimeError(f"Nifty 500 source contains duplicate symbol {symbol!r}")
+        seen.add(symbol)
+        rows.append((symbol, industry))
+    if len(rows) != 500:
+        raise RuntimeError(f"Nifty 500 source has {len(rows)} unique symbols, want 500")
+    return rows
+
+
+def write_india_universe(constituents: list[tuple[str, str]]) -> None:
+    """Write exactly the official symbols, in official CSV order, to india.csv."""
+    output = UNIVERSES / "india.csv"
+    with output.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f, lineterminator="\n")
+        writer.writerow(["Symbol"])
+        writer.writerows((symbol,) for symbol, _ in constituents)
+    print(f"wrote {len(constituents)} symbols to {output.relative_to(ROOT)}")
 
 
 class TableParser(HTMLParser):
@@ -126,9 +139,9 @@ def sp500_rows(html: str) -> dict[str, tuple[str, str]]:
     return out
 
 
-def india_rows() -> list[dict[str, str]]:
-    official = {r["Symbol"].strip(): r["Industry"].strip() for r in csv.DictReader(io.StringIO(download(NIFTY500_URL))) if r["Symbol"].strip()}
-    official.update(NIFTY500_MARCH_2026_INDUSTRY)
+def india_rows(official: dict[str, str] | None = None) -> list[dict[str, str]]:
+    if official is None:
+        official = dict(official_india_constituents(download(NIFTY500_URL)))
     wanted = universe("india")
     missing = wanted - official.keys()
     if missing: raise RuntimeError(f"India source missing pinned symbols: {sorted(missing)}")
@@ -170,6 +183,20 @@ def write(market: str, rows: list[dict[str, str]]) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--refresh-india-universe",
+        action="store_true",
+        help="replace india.csv with the current official Nifty 500 list and regenerate only India mappings",
+    )
+    args = parser.parse_args()
+
+    if args.refresh_india_universe:
+        constituents = official_india_constituents(download(NIFTY500_URL))
+        write_india_universe(constituents)
+        write("india", india_rows(dict(constituents)))
+        return
+
     write("india", india_rows())
     write("us", us_rows())
 
