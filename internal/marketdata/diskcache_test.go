@@ -2,6 +2,8 @@ package marketdata
 
 import (
 	"context"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -142,14 +144,14 @@ func TestDeltaPeriod(t *testing.T) {
 		daysAgo  int
 		expected string
 	}{
-		{1, "5d"},   // 1+3=4 days total → 5d
-		{3, "1mo"},  // 3+3=6 days total → 1mo (overlap pushes past 5d)
-		{10, "1mo"}, // 10+3=13 → 1mo
-		{50, "3mo"}, // 50+3=53 → 3mo
-		{120, "6mo"},
-		{300, "1y"},
-		{600, "2y"},
-		{1000, "5y"}, // falls back to orig
+		{1, "5d"},
+		{3, "5d"},
+		{10, "5d"},
+		{50, "5d"},
+		{120, "5d"},
+		{300, "5d"},
+		{600, "5d"},
+		{1000, "5d"},
 	}
 
 	for _, tc := range cases {
@@ -190,4 +192,261 @@ func TestDiskCache_CacheFileCreated(t *testing.T) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		t.Error("cache file should exist after fetch")
 	}
+}
+
+func TestDiskCache_GetHistoryWithProvenanceCacheHitSkipsUpstream(t *testing.T) {
+	tmpDir := t.TempDir()
+	mock := &mockProvider{
+		data: []OHLCV{
+			{Date: time.Date(2025, 3, 25, 0, 0, 0, 0, time.UTC), Close: 100},
+			{Date: time.Date(2025, 3, 26, 0, 0, 0, 0, time.UTC), Close: 105},
+			{Date: time.Date(2025, 3, 27, 0, 0, 0, 0, time.UTC), Close: 110},
+		},
+	}
+	dc := &DiskCachedProvider{inner: mock, cacheDir: tmpDir}
+
+	_, err := dc.GetHistoryWithProvenance(context.Background(), HistoryRequest{
+		Symbol: "AAPL", Period: "5y", Interval: "1d",
+	})
+	if err != nil {
+		t.Fatalf("initial fetch failed: %v", err)
+	}
+
+	result, err := dc.GetHistoryWithProvenance(context.Background(), HistoryRequest{
+		Symbol: "AAPL", Period: "5y", Interval: "1d", AsOf: time.Date(2025, 3, 27, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("cache hit failed: %v", err)
+	}
+	if mock.callCount != 1 {
+		t.Fatalf("cache hit should not call upstream, got %d calls", mock.callCount)
+	}
+	if result.Provenance.Source != HistorySourceCache {
+		t.Fatalf("source = %q, want %q", result.Provenance.Source, HistorySourceCache)
+	}
+	if result.Provenance.FetchedAt.IsZero() {
+		t.Fatal("expected fetched time in provenance")
+	}
+	if !sameDay(result.Provenance.LastBarDate, time.Date(2025, 3, 27, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("last bar date = %s, want 2025-03-27", result.Provenance.LastBarDate.Format("2006-01-02"))
+	}
+	if result.Provenance.Stale {
+		t.Fatal("cache hit should not be marked stale")
+	}
+}
+
+func TestDiskCache_GetHistoryWithProvenanceTailFetchUsesFiveDayOverlapAndMerges(t *testing.T) {
+	tmpDir := t.TempDir()
+	mock := &recordingProvider{
+		data: []OHLCV{
+			{Date: time.Date(2025, 3, 25, 0, 0, 0, 0, time.UTC), Close: 100},
+			{Date: time.Date(2025, 3, 26, 0, 0, 0, 0, time.UTC), Close: 105},
+			{Date: time.Date(2025, 3, 27, 0, 0, 0, 0, time.UTC), Close: 110},
+		},
+	}
+	dc := &DiskCachedProvider{inner: mock, cacheDir: tmpDir}
+
+	_, err := dc.GetHistoryWithProvenance(context.Background(), HistoryRequest{
+		Symbol: "MSFT", Period: "5y", Interval: "1d",
+	})
+	if err != nil {
+		t.Fatalf("initial fetch failed: %v", err)
+	}
+
+	mock.data = []OHLCV{
+		{Date: time.Date(2025, 3, 26, 0, 0, 0, 0, time.UTC), Close: 106},
+		{Date: time.Date(2025, 3, 27, 0, 0, 0, 0, time.UTC), Close: 111},
+		{Date: time.Date(2025, 3, 28, 0, 0, 0, 0, time.UTC), Close: 115},
+	}
+	result, err := dc.GetHistoryWithProvenance(context.Background(), HistoryRequest{
+		Symbol: "MSFT", Period: "5y", Interval: "1d", AsOf: time.Date(2025, 3, 28, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("tail fetch failed: %v", err)
+	}
+	if len(mock.calls) != 2 {
+		t.Fatalf("expected 2 upstream calls, got %d", len(mock.calls))
+	}
+	if mock.calls[0].period != "5y" {
+		t.Fatalf("initial fetch period = %q, want 5y", mock.calls[0].period)
+	}
+	if mock.calls[1].period != "5d" {
+		t.Fatalf("tail fetch period = %q, want 5d", mock.calls[1].period)
+	}
+	if result.Provenance.Source != HistorySourceCacheAndUpstream {
+		t.Fatalf("source = %q, want %q", result.Provenance.Source, HistorySourceCacheAndUpstream)
+	}
+	if len(result.Data) != 4 {
+		t.Fatalf("expected 4 merged bars, got %d", len(result.Data))
+	}
+	if result.Data[1].Close != 106 || result.Data[2].Close != 111 || result.Data[3].Close != 115 {
+		t.Fatalf("unexpected merged closes: %.0f %.0f %.0f", result.Data[1].Close, result.Data[2].Close, result.Data[3].Close)
+	}
+}
+
+func TestDiskCache_StaleFallbackProvenanceAndNoStderr(t *testing.T) {
+	tmpDir := t.TempDir()
+	mock := &mockProvider{
+		data: []OHLCV{
+			{Date: time.Date(2025, 3, 25, 0, 0, 0, 0, time.UTC), Close: 100},
+			{Date: time.Date(2025, 3, 26, 0, 0, 0, 0, time.UTC), Close: 105},
+		},
+	}
+	dc := &DiskCachedProvider{inner: mock, cacheDir: tmpDir}
+
+	_, err := dc.GetHistory(context.Background(), "STALE2", "5y", "1d")
+	if err != nil {
+		t.Fatalf("initial fetch failed: %v", err)
+	}
+
+	mock.shouldFail = true
+	stderr := captureStderr(t, func() {
+		data, err := dc.GetHistory(context.Background(), "STALE2", "5y", "1d")
+		if err != nil {
+			t.Fatalf("legacy stale fallback should not return error: %v", err)
+		}
+		if len(data) != 2 {
+			t.Fatalf("expected 2 stale bars, got %d", len(data))
+		}
+	})
+	if stderr != "" {
+		t.Fatalf("cache provider wrote to stderr: %q", stderr)
+	}
+
+	result, err := dc.GetHistoryWithProvenance(context.Background(), HistoryRequest{
+		Symbol: "STALE2", Period: "5y", Interval: "1d", AsOf: time.Date(2025, 3, 27, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("provenance stale fallback should not return error: %v", err)
+	}
+	if !result.Provenance.Stale {
+		t.Fatal("expected stale provenance")
+	}
+	if result.Provenance.UpstreamError == "" {
+		t.Fatal("expected upstream error in provenance")
+	}
+	if result.Provenance.Source != HistorySourceCache {
+		t.Fatalf("source = %q, want %q", result.Provenance.Source, HistorySourceCache)
+	}
+}
+
+func TestDiskCache_WriteCacheAtomicNoTempFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	mock := &mockProvider{
+		data: []OHLCV{{Date: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), Close: 100}},
+	}
+	dc := &DiskCachedProvider{inner: mock, cacheDir: tmpDir}
+
+	if _, err := dc.GetHistory(context.Background(), "ATOMIC", "5y", "1d"); err != nil {
+		t.Fatalf("fetch failed: %v", err)
+	}
+
+	matches, err := filepath.Glob(filepath.Join(tmpDir, "*.tmp"))
+	if err != nil {
+		t.Fatalf("glob failed: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("expected no temp files after atomic write, got %v", matches)
+	}
+}
+
+func TestDiskCache_WriteLockSerializesWriters(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "LOCKED_5y_1d.gob")
+
+	unlockFirst := acquireCacheWriteLock(path)
+	lockDir := path + ".lock"
+	if _, err := os.Stat(lockDir); err != nil {
+		unlockFirst()
+		t.Fatalf("expected lock directory to exist: %v", err)
+	}
+
+	acquired := make(chan func(), 1)
+	go func() {
+		acquired <- acquireCacheWriteLock(path)
+	}()
+
+	select {
+	case unlockSecond := <-acquired:
+		unlockSecond()
+		unlockFirst()
+		t.Fatal("second writer acquired lock before first writer released it")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	unlockFirst()
+	select {
+	case unlockSecond := <-acquired:
+		unlockSecond()
+	case <-time.After(2 * time.Second):
+		t.Fatal("second writer did not acquire lock after first writer released it")
+	}
+}
+
+func TestDiskCache_WriteLockDoesNotProceedWithoutOwningLock(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "LONG_LOCK_5y_1d.gob")
+
+	unlockFirst := acquireCacheWriteLock(path)
+	defer unlockFirst()
+
+	acquired := make(chan func(), 1)
+	go func() { acquired <- acquireCacheWriteLock(path) }()
+
+	select {
+	case unlockSecond := <-acquired:
+		unlockSecond()
+		t.Fatal("writer proceeded without acquiring a lock held for two seconds")
+	case <-time.After(2 * time.Second):
+	}
+}
+
+type historyCall struct {
+	symbol   string
+	period   string
+	interval string
+}
+
+type recordingProvider struct {
+	data       []OHLCV
+	shouldFail bool
+	calls      []historyCall
+}
+
+func (r *recordingProvider) GetHistory(_ context.Context, symbol, period, interval string) ([]OHLCV, error) {
+	r.calls = append(r.calls, historyCall{symbol: symbol, period: period, interval: interval})
+	if r.shouldFail {
+		return nil, errors.New("recording provider failure")
+	}
+	return r.data, nil
+}
+
+func (r *recordingProvider) GetQuote(_ context.Context, symbol string) (*Quote, error) {
+	return &Quote{Symbol: symbol, Price: 100}, nil
+}
+
+func sameDay(a, b time.Time) bool {
+	return a.Format("2006-01-02") == b.Format("2006-01-02")
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe stderr: %v", err)
+	}
+	os.Stderr = w
+
+	fn()
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("close stderr writer: %v", err)
+	}
+	os.Stderr = old
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read stderr: %v", err)
+	}
+	return string(out)
 }

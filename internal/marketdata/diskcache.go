@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,9 +35,7 @@ type diskCacheEntry struct {
 	Data        []OHLCV
 }
 
-// overlapDays is the number of extra days fetched before LastBarDate
-// to catch corrections, splits, or late-arriving data.
-const overlapDays = 3
+const tailFetchPeriod = "5d"
 
 // NewDiskCachedProvider creates a caching wrapper that persists data to disk.
 func NewDiskCachedProvider(inner Provider) *DiskCachedProvider {
@@ -56,30 +53,15 @@ func diskCacheFilename(symbol, period, interval string) string {
 	return fmt.Sprintf("%s_%s_%s.gob", safe, period, interval)
 }
 
-// deltaPeriod calculates the Yahoo Finance period string needed to fetch
-// data from (lastBarDate - overlapDays) to now.
-// Returns a period like "5d", "1mo", "3mo", "6mo", "1y", or the original
-// period if the gap is too large.
+// deltaPeriod returns the fixed overlap/tail range used after an initial
+// full fetch. The 5-day window catches corrections, splits, and late bars
+// without refetching the full requested history.
 func deltaPeriod(lastBarDate time.Time, origPeriod string) string {
-	daysSince := int(math.Ceil(time.Since(lastBarDate).Hours()/24)) + overlapDays
+	return deltaPeriodAsOf(lastBarDate, time.Now(), origPeriod)
+}
 
-	switch {
-	case daysSince <= 5:
-		return "5d"
-	case daysSince <= 25:
-		return "1mo"
-	case daysSince <= 85:
-		return "3mo"
-	case daysSince <= 170:
-		return "6mo"
-	case daysSince <= 360:
-		return "1y"
-	case daysSince <= 720:
-		return "2y"
-	default:
-		// Gap too large — do a full refetch
-		return origPeriod
-	}
+func deltaPeriodAsOf(lastBarDate, asOf time.Time, origPeriod string) string {
+	return tailFetchPeriod
 }
 
 // mergeOHLCV merges new bars into existing cached bars.
@@ -131,9 +113,24 @@ func sortStrings(s []string) {
 	}
 }
 
-// GetHistory always fetches the delta, merges with cache, saves, and returns.
-// If upstream fails, returns stale cached data with a nil error.
+// GetHistory preserves the legacy Provider contract. If a cached value exists
+// and upstream refresh fails, stale cached data is returned with a nil error.
 func (d *DiskCachedProvider) GetHistory(ctx context.Context, symbol, period, interval string) ([]OHLCV, error) {
+	result, err := d.GetHistoryWithProvenance(ctx, HistoryRequest{
+		Symbol:   symbol,
+		Period:   period,
+		Interval: interval,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result.Data, nil
+}
+
+// GetHistoryWithProvenance returns historical bars with cache/upstream
+// provenance while keeping cache refresh behavior internal to the provider.
+func (d *DiskCachedProvider) GetHistoryWithProvenance(ctx context.Context, req HistoryRequest) (*HistoryResult, error) {
+	symbol, period, interval := req.Symbol, req.Period, req.Interval
 	path := filepath.Join(d.cacheDir, diskCacheFilename(symbol, period, interval))
 
 	// Try reading existing cache
@@ -145,24 +142,56 @@ func (d *DiskCachedProvider) GetHistory(ctx context.Context, symbol, period, int
 		if err != nil {
 			return nil, err
 		}
-		d.writeCache(path, data, period)
-		return data, nil
+		fetchedAt, lastBar := d.writeCache(path, data, period)
+		return &HistoryResult{
+			Data: data,
+			Provenance: HistoryProvenance{
+				Source:      HistorySourceUpstream,
+				FetchedAt:   fetchedAt,
+				LastBarDate: lastBar,
+			},
+		}, nil
+	}
+
+	if cacheCoversRequest(entry, req) {
+		return &HistoryResult{
+			Data: entry.Data,
+			Provenance: HistoryProvenance{
+				Source:      HistorySourceCache,
+				FetchedAt:   entry.FetchedAt,
+				LastBarDate: entry.LastBarDate,
+			},
+		}, nil
 	}
 
 	// Cache exists — fetch delta
-	dp := deltaPeriod(entry.LastBarDate, period)
+	dp := deltaPeriodAsOf(entry.LastBarDate, req.AsOf, period)
 	fresh, err := d.inner.GetHistory(ctx, symbol, dp, interval)
 	if err != nil {
 		// Stale-while-revalidate: return cached data on upstream failure
-		fmt.Fprintf(os.Stderr, "⚠ Delta fetch failed for %s, using cached data (%s): %v\n",
-			symbol, entry.FetchedAt.Format("2006-01-02 15:04"), err)
-		return entry.Data, nil
+		return &HistoryResult{
+			Data: entry.Data,
+			Provenance: HistoryProvenance{
+				Source:        HistorySourceCache,
+				FetchedAt:     entry.FetchedAt,
+				LastBarDate:   entry.LastBarDate,
+				Stale:         true,
+				UpstreamError: err.Error(),
+			},
+		}, nil
 	}
 
 	// Merge and save
 	merged := mergeOHLCV(entry.Data, fresh)
-	d.writeCache(path, merged, period)
-	return merged, nil
+	fetchedAt, lastBar := d.writeCache(path, merged, period)
+	return &HistoryResult{
+		Data: merged,
+		Provenance: HistoryProvenance{
+			Source:      HistorySourceCacheAndUpstream,
+			FetchedAt:   fetchedAt,
+			LastBarDate: lastBar,
+		},
+	}, nil
 }
 
 // GetQuote delegates to the inner provider (no caching for real-time quotes).
@@ -184,25 +213,70 @@ func (d *DiskCachedProvider) readCache(path string) (*diskCacheEntry, error) {
 	return &entry, nil
 }
 
-func (d *DiskCachedProvider) writeCache(path string, data []OHLCV, origPeriod string) {
-	f, err := os.Create(path)
-	if err != nil {
-		return
+func cacheCoversRequest(entry *diskCacheEntry, req HistoryRequest) bool {
+	if req.AsOf.IsZero() {
+		return sameHistoryDay(entry.LastBarDate, time.Now())
 	}
-	defer f.Close()
+	return !entry.LastBarDate.Before(truncateHistoryDay(req.AsOf))
+}
 
+func truncateHistoryDay(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
+}
+
+func sameHistoryDay(a, b time.Time) bool {
+	return truncateHistoryDay(a).Equal(truncateHistoryDay(b))
+}
+
+func (d *DiskCachedProvider) writeCache(path string, data []OHLCV, origPeriod string) (time.Time, time.Time) {
 	lastBar := time.Time{}
 	if len(data) > 0 {
 		lastBar = data[len(data)-1].Date
 	}
-
+	fetchedAt := time.Now()
 	entry := diskCacheEntry{
-		FetchedAt:   time.Now(),
+		FetchedAt:   fetchedAt,
 		LastBarDate: lastBar,
 		OrigPeriod:  origPeriod,
 		Data:        data,
 	}
-	gob.NewEncoder(f).Encode(entry)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fetchedAt, lastBar
+	}
+	unlock := acquireCacheWriteLock(path)
+	defer unlock()
+
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fetchedAt, lastBar
+	}
+	tmpName := tmp.Name()
+	rename := false
+	if err := gob.NewEncoder(tmp).Encode(entry); err == nil {
+		if err := tmp.Sync(); err == nil {
+			rename = true
+		}
+	}
+	if err := tmp.Close(); err != nil {
+		rename = false
+	}
+	if rename {
+		if err := os.Rename(tmpName, path); err == nil {
+			return fetchedAt, lastBar
+		}
+	}
+	_ = os.Remove(tmpName)
+	return fetchedAt, lastBar
+}
+
+func acquireCacheWriteLock(path string) func() {
+	lockDir := path + ".lock"
+	for {
+		if err := os.Mkdir(lockDir, 0755); err == nil {
+			return func() { _ = os.Remove(lockDir) }
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // CacheStats holds statistics about the disk cache.
