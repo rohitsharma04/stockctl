@@ -25,7 +25,7 @@ var (
 	progressMode string
 	appConfig    *config.Config
 	activeMarket marketdata.Market
-	runDir       string         // unique per-run output directory
+	runDir       string          // unique per-run output directory
 	rootCtx      context.Context // root context, supports --timeout
 )
 
@@ -115,6 +115,12 @@ Output files:  /tmp/stockctl/run_<timestamp>_<id>/ (unique per run, never overwr
 		// Override output format from flag if set
 		if cmd.Flags().Changed("output") {
 			appConfig.General.Output = outputFmt
+		}
+
+		// seed history owns a repeatable local --market flag rather than the
+		// single global market selection used by interactive commands.
+		if cmd.Name() == "history" && cmd.Parent() != nil && cmd.Parent().Name() == "seed" {
+			return nil
 		}
 
 		// Resolve market
@@ -211,4 +217,3 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&progressMode, "progress", "", "progress output mode: text, json, none (default: text, or none with --quiet)")
 	rootCmd.AddCommand(marketsCmd)
 }
-
