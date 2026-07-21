@@ -31,33 +31,26 @@ func (s CircuitState) String() string {
 
 // CircuitBreakerConfig holds the tuning parameters for the circuit breaker.
 type CircuitBreakerConfig struct {
-	MaxFailures    int           // Consecutive failures before opening (default 5)
-	CooldownPeriod time.Duration // How long the circuit stays open (default 30s)
+	MaxFailures    int
+	CooldownPeriod time.Duration
 }
 
-// DefaultCircuitBreakerConfig returns sensible defaults.
 func DefaultCircuitBreakerConfig() CircuitBreakerConfig {
-	return CircuitBreakerConfig{
-		MaxFailures:    5,
-		CooldownPeriod: 30 * time.Second,
-	}
+	return CircuitBreakerConfig{MaxFailures: 5, CooldownPeriod: 30 * time.Second}
 }
 
 // CircuitBreakerProvider wraps a Provider with circuit breaker logic.
-// After MaxFailures consecutive failures, the circuit opens and all requests
-// are immediately rejected for CooldownPeriod. After cooldown, a single probe
-// request is allowed — success closes the circuit, failure reopens it.
 type CircuitBreakerProvider struct {
 	inner  Provider
 	config CircuitBreakerConfig
 
-	mu          sync.Mutex
-	state       CircuitState
-	failures    int
-	lastFailure time.Time
+	mu               sync.Mutex
+	state            CircuitState
+	failures         int
+	lastFailure      time.Time
+	halfOpenInFlight bool
 }
 
-// NewCircuitBreakerProvider wraps a provider with circuit breaker protection.
 func NewCircuitBreakerProvider(inner Provider, cfg CircuitBreakerConfig) *CircuitBreakerProvider {
 	if cfg.MaxFailures <= 0 {
 		cfg.MaxFailures = 5
@@ -65,67 +58,84 @@ func NewCircuitBreakerProvider(inner Provider, cfg CircuitBreakerConfig) *Circui
 	if cfg.CooldownPeriod <= 0 {
 		cfg.CooldownPeriod = 30 * time.Second
 	}
-	return &CircuitBreakerProvider{
-		inner:  inner,
-		config: cfg,
-		state:  CircuitClosed,
-	}
+	return &CircuitBreakerProvider{inner: inner, config: cfg, state: CircuitClosed}
 }
 
-// ErrCircuitOpen is returned when the circuit breaker is open.
 var ErrCircuitOpen = fmt.Errorf("circuit breaker is open: too many consecutive failures")
 
-// State returns the current circuit state (thread-safe).
 func (cb *CircuitBreakerProvider) State() CircuitState {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	return cb.state
 }
 
-// Failures returns the current consecutive failure count.
 func (cb *CircuitBreakerProvider) Failures() int {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	return cb.failures
 }
 
-// allowRequest checks whether a request should be allowed through.
-func (cb *CircuitBreakerProvider) allowRequest() bool {
+// allowRequest atomically reserves the sole half-open probe. The returned bool
+// identifies that reservation so completion cannot be confused with an older
+// closed-state request completing concurrently.
+func (cb *CircuitBreakerProvider) allowRequest() (allowed, probe bool) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
 	switch cb.state {
 	case CircuitClosed:
-		return true
+		return true, false
 	case CircuitOpen:
-		// Check if cooldown has elapsed
-		if time.Since(cb.lastFailure) >= cb.config.CooldownPeriod {
-			cb.state = CircuitHalfOpen
-			return true
+		if time.Since(cb.lastFailure) < cb.config.CooldownPeriod {
+			return false, false
 		}
-		return false
+		cb.state = CircuitHalfOpen
+		cb.halfOpenInFlight = true
+		return true, true
 	case CircuitHalfOpen:
-		// Only one probe allowed — additional requests are rejected
-		// The first caller to reach here gets through; subsequent ones
-		// are blocked until the probe completes. For simplicity, we
-		// allow it since the mu is released before the actual call.
-		return true
+		return false, false
+	default:
+		return false, false
 	}
-	return false
 }
 
-// recordSuccess resets the circuit breaker on a successful request.
-func (cb *CircuitBreakerProvider) recordSuccess() {
+func (cb *CircuitBreakerProvider) recordSuccess(probe bool) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+	if probe {
+		// Only the reserved probe may close a half-open circuit.
+		if cb.state != CircuitHalfOpen || !cb.halfOpenInFlight {
+			return
+		}
+		cb.halfOpenInFlight = false
+		cb.state = CircuitClosed
+		cb.failures = 0
+		return
+	}
+	// Do not let an older normal request interfere with a live probe.
+	if cb.state == CircuitHalfOpen {
+		return
+	}
 	cb.state = CircuitClosed
 	cb.failures = 0
 }
 
-// recordFailure increments the failure counter and potentially opens the circuit.
-func (cb *CircuitBreakerProvider) recordFailure() {
+func (cb *CircuitBreakerProvider) recordFailure(probe bool) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+	if probe {
+		if cb.state != CircuitHalfOpen || !cb.halfOpenInFlight {
+			return
+		}
+		cb.halfOpenInFlight = false
+		cb.state = CircuitOpen
+		cb.lastFailure = time.Now()
+		return
+	}
+	// A request started while closed must not alter a half-open probe.
+	if cb.state == CircuitHalfOpen {
+		return
+	}
 	cb.failures++
 	cb.lastFailure = time.Now()
 	if cb.failures >= cb.config.MaxFailures {
@@ -133,36 +143,37 @@ func (cb *CircuitBreakerProvider) recordFailure() {
 	}
 }
 
-// GetHistory fetches historical data, guarded by the circuit breaker.
-func (cb *CircuitBreakerProvider) GetHistory(ctx context.Context, symbol, period, interval string) ([]OHLCV, error) {
-	if !cb.allowRequest() {
-		return nil, fmt.Errorf("%w (cooldown %s remaining)", ErrCircuitOpen,
-			(cb.config.CooldownPeriod - time.Since(cb.lastFailure)).Truncate(time.Second))
-	}
+func (cb *CircuitBreakerProvider) circuitOpenError() error {
+	cb.mu.Lock()
+	remaining := cb.config.CooldownPeriod - time.Since(cb.lastFailure)
+	cb.mu.Unlock()
+	return fmt.Errorf("%w (cooldown %s remaining)", ErrCircuitOpen, remaining.Truncate(time.Second))
+}
 
+func (cb *CircuitBreakerProvider) GetHistory(ctx context.Context, symbol, period, interval string) ([]OHLCV, error) {
+	allowed, probe := cb.allowRequest()
+	if !allowed {
+		return nil, cb.circuitOpenError()
+	}
 	data, err := cb.inner.GetHistory(ctx, symbol, period, interval)
 	if err != nil {
-		cb.recordFailure()
+		cb.recordFailure(probe)
 		return nil, err
 	}
-
-	cb.recordSuccess()
+	cb.recordSuccess(probe)
 	return data, nil
 }
 
-// GetQuote fetches a real-time quote, guarded by the circuit breaker.
 func (cb *CircuitBreakerProvider) GetQuote(ctx context.Context, symbol string) (*Quote, error) {
-	if !cb.allowRequest() {
-		return nil, fmt.Errorf("%w (cooldown %s remaining)", ErrCircuitOpen,
-			(cb.config.CooldownPeriod - time.Since(cb.lastFailure)).Truncate(time.Second))
+	allowed, probe := cb.allowRequest()
+	if !allowed {
+		return nil, cb.circuitOpenError()
 	}
-
 	quote, err := cb.inner.GetQuote(ctx, symbol)
 	if err != nil {
-		cb.recordFailure()
+		cb.recordFailure(probe)
 		return nil, err
 	}
-
-	cb.recordSuccess()
+	cb.recordSuccess(probe)
 	return quote, nil
 }

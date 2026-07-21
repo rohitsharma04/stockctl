@@ -2,7 +2,9 @@ package marketdata
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -130,6 +132,62 @@ func TestCircuitBreaker_HalfOpenFailureReopens(t *testing.T) {
 	}
 }
 
+func TestCircuitBreaker_HalfOpenAllowsOnlyOneInFlightProbe(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseProbe := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseProbe()
+
+	mock := &blockingProvider{
+		started: started,
+		release: release,
+		data:    []OHLCV{{Close: 200}},
+		err:     fmt.Errorf("initial failure"),
+	}
+	cfg := CircuitBreakerConfig{MaxFailures: 1, CooldownPeriod: time.Minute}
+	cb := NewCircuitBreakerProvider(mock, cfg)
+
+	_, _ = cb.GetHistory(context.Background(), "AAPL", "1y", "1d")
+	if cb.State() != CircuitOpen {
+		t.Fatal("expected open state")
+	}
+
+	// Put the breaker just beyond its cooldown without a wall-clock sleep. This
+	// makes the concurrent half-open race reproducible rather than timing-based.
+	cb.mu.Lock()
+	cb.lastFailure = time.Now().Add(-cfg.CooldownPeriod)
+	cb.mu.Unlock()
+	mock.err = nil
+
+	probeDone := make(chan error, 1)
+	go func() {
+		_, err := cb.GetHistory(context.Background(), "AAPL", "1y", "1d")
+		probeDone <- err
+	}()
+
+	<-started
+	if cb.State() != CircuitHalfOpen {
+		t.Fatalf("expected half-open while probe is in flight, got %s", cb.State())
+	}
+
+	_, err := cb.GetHistory(context.Background(), "MSFT", "1y", "1d")
+	if !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("expected circuit-open rejection for second request, got %v", err)
+	}
+	if got := mock.calls(); got != 2 {
+		t.Fatalf("expected only initial failure and one probe to reach inner provider, got %d calls", got)
+	}
+
+	releaseProbe()
+	if err := <-probeDone; err != nil {
+		t.Fatalf("probe should succeed: %v", err)
+	}
+	if cb.State() != CircuitClosed {
+		t.Fatalf("expected closed after probe success, got %s", cb.State())
+	}
+}
+
 func TestCircuitBreaker_SuccessResetsFailures(t *testing.T) {
 	mock := &mockProvider{shouldFail: true}
 	cfg := CircuitBreakerConfig{MaxFailures: 3, CooldownPeriod: 1 * time.Second}
@@ -152,4 +210,39 @@ func TestCircuitBreaker_SuccessResetsFailures(t *testing.T) {
 	if cb.State() != CircuitClosed {
 		t.Errorf("expected closed, got %s", cb.State())
 	}
+}
+
+type blockingProvider struct {
+	started chan<- struct{}
+	release <-chan struct{}
+	data    []OHLCV
+	err     error
+	mu      sync.Mutex
+	once    sync.Once
+	count   int
+}
+
+func (m *blockingProvider) GetHistory(_ context.Context, _, _, _ string) ([]OHLCV, error) {
+	m.mu.Lock()
+	m.count++
+	m.mu.Unlock()
+	if m.err != nil {
+		return nil, m.err
+	}
+	m.once.Do(func() { close(m.started) })
+	<-m.release
+	return m.data, nil
+}
+
+func (m *blockingProvider) GetQuote(_ context.Context, symbol string) (*Quote, error) {
+	m.mu.Lock()
+	m.count++
+	m.mu.Unlock()
+	return &Quote{Symbol: symbol, Price: 100.0}, nil
+}
+
+func (m *blockingProvider) calls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.count
 }
