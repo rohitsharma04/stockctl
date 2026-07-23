@@ -78,7 +78,12 @@ def due_market(now_utc: dt.datetime) -> str | None:
 
     for market, cfg in MARKETS.items():
         local_now = now_utc.astimezone(ZoneInfo(cfg["tz"]))
-        if local_now.hour == cfg["hour"] and local_now.minute == cfg["minute"]:
+        # Cron dispatch can start a few minutes after its nominal minute. The
+        # per-market sent marker below makes this grace window idempotent.
+        if (
+            local_now.hour == cfg["hour"]
+            and cfg["minute"] <= local_now.minute < cfg["minute"] + 15
+        ):
             return market
     return None
 
