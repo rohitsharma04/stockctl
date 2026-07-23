@@ -321,11 +321,41 @@ stockctl backtest --input signals.csv --tp-range 0.10:0.30 --sl-range 0.02:0.08
 
 Market data is cached to `~/.stockctl/cache/` (24-hour TTL) to avoid redundant API calls.
 
+Use the safe cache workflow: inspect and verify first, then clear only with explicit confirmation. Both cache commands support table or JSON output; CSV is rejected.
+
 ```bash
-stockctl cache stats --output json   # View cache size and age
-stockctl cache clear                 # Clear all cached data
-stockctl cache clear -m india        # Clear only Indian market data
+stockctl cache stats --verify --output json --quiet  # Include corrupt-entry count
+stockctl cache clear --yes                           # Clear all cached data (confirmation required)
+stockctl cache clear -m india --yes                  # Clear only Indian market data
 ```
+
+### Phase 4 — Seed and Verify the Cache
+
+Use this workflow to populate durable daily history for the supported seed markets (`india` and `us`) and verify it without Yahoo calls. Run seed operations one at a time.
+
+Ownership is explicit: `stockctl` owns seed checkpointing, retry policy, rate limiting, resume behavior, and cache reads/writes. Hermes only schedules, launches, and supervises delivery; it does not implement or own seed-state behavior.
+
+```bash
+# Seed all available daily history; --market is required and repeatable.
+stockctl seed history --market us --period max --output json --quiet
+
+# Inspect the durable checkpoint (default: ~/.stockctl/seed-history-state.json).
+stockctl seed status --output json --quiet
+
+# Verify cache entries locally; --market is required and repeatable.
+stockctl seed verify --market us --period max --output json --quiet
+
+# Inspect general cache health, including decodable/corrupt entries.
+stockctl cache stats --verify --output json --quiet
+
+# Only after inspection, clear cache with explicit confirmation.
+stockctl cache clear --yes
+
+# Or limit the clear to one market.
+stockctl cache clear --market india --yes
+```
+
+`seed history` is intentionally sequential (`--workers 1` only), resumes from its checkpoint, and cannot be combined with `--no-cache`. Use `--state-file <path>` with `seed history` or `seed status` to use a specific checkpoint. JSON output is the standard machine-readable envelope; pair it with `--quiet` to suppress progress output. `seed status`, `seed verify`, and all cache subcommands reject CSV output.
 
 ### 7. `stockctl markets` — List All Markets
 

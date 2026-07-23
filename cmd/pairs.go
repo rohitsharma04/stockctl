@@ -16,17 +16,64 @@ import (
 )
 
 var (
-	pairsStocks       string
-	pairsThreshold    float64
-	pairsCapital      float64
-	pairsWindow       int
-	pairsZThresh      float64
+	pairsStocks        string
+	pairsThreshold     float64
+	pairsCapital       float64
+	pairsWindow        int
+	pairsZThresh       float64
 	pairsExportSignals bool
 )
 
+var pairsProviderFactory = func(noCache bool) marketdata.Provider { return marketdata.BuildProvider(noCache) }
+
+type pairResult struct {
+	pairs.SimulationResult
+	Correlation float64                                 `json:"correlation"`
+	AlignedBars int                                     `json:"aligned_bars"`
+	DataAsOf    string                                  `json:"data_as_of,omitempty"`
+	Provenance  map[string]marketdata.HistoryProvenance `json:"provenance"`
+}
+
+type pairSymbolResult struct {
+	Symbol     string                       `json:"symbol"`
+	DataAsOf   string                       `json:"data_as_of,omitempty"`
+	Provenance marketdata.HistoryProvenance `json:"provenance"`
+}
+
+// pairsResultSet retains the successful-input audit even when correlation
+// analysis cannot produce a tradable pair.
+type pairsResultSet struct {
+	Pairs   []pairResult       `json:"pairs"`
+	Symbols []pairSymbolResult `json:"symbols"`
+}
+
+type stockEntry struct {
+	symbol     string
+	data       []marketdata.OHLCV
+	provenance marketdata.HistoryProvenance
+}
+
+// pairsSnapshotError preserves successful/failed fetch diagnostics when there
+// are too few usable symbols to continue correlation analysis.
+type pairsSnapshotError struct {
+	err         error
+	results     pairsResultSet
+	fetchErrors []output.ErrorInfo
+}
+
+func (e *pairsSnapshotError) Error() string { return e.err.Error() }
+func (e *pairsSnapshotError) Unwrap() error { return e.err }
+func (e *pairsSnapshotError) JSONResults() interface{} {
+	return e.results
+}
+func (e *pairsSnapshotError) JSONErrors() []output.ErrorInfo {
+	return append([]output.ErrorInfo(nil), e.fetchErrors...)
+}
+
 var pairsCmd = &cobra.Command{
-	Use:   "pairs",
-	Short: "Run pairs trading analysis",
+	Use:          "pairs",
+	Short:        "Run pairs trading analysis",
+	SilenceUsage: true,
 	Long: `Find correlated stock pairs and simulate mean-reversion pairs trading.
 
 Uses z-score based entry/exit signals on the price spread between
@@ -50,6 +97,9 @@ func init() {
 }
 
 func runPairs(cmd *cobra.Command, args []string) error {
+	if selectedOutputFormat() == output.FormatCSV {
+		return fmt.Errorf("pairs does not support --output csv; use --export-signals to write a signals CSV")
+	}
 	ctx := rootCtx
 	startTime := time.Now()
 	cfg := appConfig.Pairs
@@ -89,47 +139,52 @@ func runPairs(cmd *cobra.Command, args []string) error {
 		stocks[i] = activeMarket.ApplySuffix(stocks[i])
 	}
 
-	provider := marketdata.BuildProvider(noCache)
+	provider := pairsProviderFactory(noCache)
 
 	// Download data for all stocks
 	logf("🌍 Market: %s (%s)\n", activeMarket.Name, activeMarket.Currency)
 	logf("📊 Downloading data for %d stocks...\n", len(stocks))
-	type stockEntry struct {
-		symbol string
-		data   []marketdata.OHLCV
-	}
 	var entries []stockEntry
+	var fetchErrors []output.ErrorInfo
 
 	for _, sym := range stocks {
-		data, err := provider.GetHistory(ctx, sym, "5y", "1d")
+		history, err := getHistoryResult(ctx, provider, marketdata.HistoryRequest{Symbol: sym, Period: "5y", Interval: "1d"})
 		if err != nil {
 			logf("  ⚠ Skipping %s: %v\n", sym, err)
+			fetchErrors = append(fetchErrors, output.ErrorInfo{Ticker: sym, Error: err.Error()})
 			continue
 		}
-		logf("  ✓ %s (%d bars)\n", sym, len(data))
-		entries = append(entries, stockEntry{symbol: sym, data: data})
+		logf("  ✓ %s (%d bars)\n", sym, len(history.Data))
+		entries = append(entries, stockEntry{symbol: sym, data: history.Data, provenance: history.Provenance})
 	}
 
 	if len(entries) < 2 {
-		return fmt.Errorf("need at least 2 valid stocks, got %d", len(entries))
+		return &pairsSnapshotError{
+			err:         fmt.Errorf("need at least 2 valid stocks, got %d", len(entries)),
+			results:     pairsResults(nil, entries),
+			fetchErrors: fetchErrors,
+		}
 	}
 
 	// Calculate returns
 	logf("📈 Calculating correlations...\n")
-	validSymbols := make([]string, len(entries))
-	allReturns := make([][]float64, len(entries))
-	for i, e := range entries {
-		validSymbols[i] = e.symbol
-		closes := marketdata.Closes(e.data)
-		allReturns[i] = indicators.PctChange(closes)
+	// Find correlated pairs from returns joined on the same trading dates.
+	// Position-based return slices can otherwise correlate different sessions.
+	var corrPairs []pairs.CorrelatedPair
+	for i := range entries {
+		for j := i + 1; j < len(entries); j++ {
+			leftReturns, rightReturns, _ := alignedPairReturns(entries[i].data, entries[j].data)
+			found := pairs.FindCorrelatedPairs([]string{entries[i].symbol, entries[j].symbol}, [][]float64{leftReturns, rightReturns}, threshold)
+			corrPairs = append(corrPairs, found...)
+		}
 	}
-
-	// Find correlated pairs
-	corrPairs := pairs.FindCorrelatedPairs(validSymbols, allReturns, threshold)
 	logf("🔗 Found %d correlated pairs (threshold: %.2f)\n", len(corrPairs), threshold)
 
 	if len(corrPairs) == 0 {
 		logf("No correlated pairs found. Try lowering --threshold.\n")
+		if selectedOutputFormat() == output.FormatJSON {
+			return output.WriteEnvelope(cmd.OutOrStdout(), pairsEnvelope(nil, entries, fetchErrors, time.Since(startTime)))
+		}
 		return nil
 	}
 
@@ -139,7 +194,7 @@ func runPairs(cmd *cobra.Command, args []string) error {
 		limit = len(corrPairs)
 	}
 
-	var results []pairs.SimulationResult
+	var results []pairResult
 	for _, pair := range corrPairs[:limit] {
 		// Find data for each stock
 		var data1, data2 []marketdata.OHLCV
@@ -155,19 +210,16 @@ func runPairs(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		// Align data to same length
-		minLen := len(data1)
-		if len(data2) < minLen {
-			minLen = len(data2)
+		aligned1, aligned2 := alignPairHistory(data1, data2)
+		if len(aligned1) < 2 {
+			continue
 		}
-		aligned1 := data1[len(data1)-minLen:]
-		aligned2 := data2[len(data2)-minLen:]
 
 		prices1 := marketdata.Closes(aligned1)
 		prices2 := marketdata.Closes(aligned2)
 
 		// Build time slice
-		dates := make([]time.Time, minLen)
+		dates := make([]time.Time, len(aligned1))
 		for i, bar := range aligned1 {
 			dates[i] = bar.Date
 		}
@@ -177,7 +229,14 @@ func runPairs(cmd *cobra.Command, args []string) error {
 			prices1, prices2, dates,
 			window, zThresh, cfg.ZExitLow, cfg.ZExitHigh, capital,
 		)
-		results = append(results, result)
+		_, _, asOf := alignedPairReturns(aligned1, aligned2)
+		provenance := make(map[string]marketdata.HistoryProvenance, 2)
+		for _, entry := range entries {
+			if entry.symbol == pair.Stock1 || entry.symbol == pair.Stock2 {
+				provenance[entry.symbol] = provenanceWithLastBar(entry.provenance, entry.data)
+			}
+		}
+		results = append(results, pairResult{SimulationResult: result, Correlation: pair.Correlation, AlignedBars: len(aligned1), DataAsOf: asOf.Format("2006-01-02"), Provenance: provenance})
 
 		logf("\n🔗 %s — %s (corr: %.4f)\n", pair.Stock1, pair.Stock2, pair.Correlation)
 		logf("   Hedge Ratio: %.4f\n", result.HedgeRatio)
@@ -198,16 +257,9 @@ func runPairs(cmd *cobra.Command, args []string) error {
 	}
 
 	// Output
-	switch output.Format(appConfig.General.Output) {
+	switch selectedOutputFormat() {
 	case output.FormatJSON:
-		meta := output.NewMeta("pairs")
-		meta.Market = activeMarket.ID
-		meta.DurationMs = time.Since(startTime).Milliseconds()
-		env := output.Envelope{
-			Meta:    meta,
-			Results: results,
-		}
-		return output.WriteEnvelope(os.Stdout, env)
+		return output.WriteEnvelope(cmd.OutOrStdout(), pairsEnvelope(results, entries, fetchErrors, time.Since(startTime)))
 
 	default:
 		if len(results) > 0 {
@@ -231,9 +283,61 @@ func runPairs(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func pairsEnvelope(results []pairResult, entries []stockEntry, fetchErrors []output.ErrorInfo, duration time.Duration) output.Envelope {
+	meta := output.NewMeta("pairs")
+	meta.Market = activeMarket.ID
+	meta.DurationMs = duration.Milliseconds()
+	return output.Envelope{Meta: meta, Results: pairsResults(results, entries), Errors: fetchErrors}
+}
+
+func pairsResults(results []pairResult, entries []stockEntry) pairsResultSet {
+	symbols := make([]pairSymbolResult, 0, len(entries))
+	for _, entry := range entries {
+		provenance := provenanceWithLastBar(entry.provenance, entry.data)
+		asOf := ""
+		if !provenance.LastBarDate.IsZero() {
+			asOf = provenance.LastBarDate.Format("2006-01-02")
+		}
+		symbols = append(symbols, pairSymbolResult{Symbol: entry.symbol, DataAsOf: asOf, Provenance: provenance})
+	}
+	if results == nil {
+		results = []pairResult{}
+	}
+	return pairsResultSet{Pairs: results, Symbols: symbols}
+}
+
+// alignPairHistory joins bars by trading date; tail alignment can pair prices
+// from different sessions when one symbol has missing dates.
+func alignPairHistory(a, b []marketdata.OHLCV) ([]marketdata.OHLCV, []marketdata.OHLCV) {
+	byDay := make(map[string]marketdata.OHLCV, len(b))
+	for _, bar := range b {
+		byDay[bar.Date.Format("2006-01-02")] = bar
+	}
+	left, right := make([]marketdata.OHLCV, 0), make([]marketdata.OHLCV, 0)
+	for _, bar := range a {
+		if other, ok := byDay[bar.Date.Format("2006-01-02")]; ok {
+			left = append(left, bar)
+			right = append(right, other)
+		}
+	}
+	return left, right
+}
+
+// alignedPairReturns calculates close-to-close returns only after joining the
+// price histories by date. It also returns the newest common trading date.
+func alignedPairReturns(a, b []marketdata.OHLCV) ([]float64, []float64, time.Time) {
+	left, right := alignPairHistory(a, b)
+	if len(left) < 2 {
+		return nil, nil, time.Time{}
+	}
+	leftReturns := indicators.PctChange(marketdata.Closes(left))
+	rightReturns := indicators.PctChange(marketdata.Closes(right))
+	return leftReturns[1:], rightReturns[1:], left[len(left)-1].Date
+}
+
 // exportPairsSignals writes trade signals from pairs simulation as a
 // backtest-compatible CSV file that can be fed to `stockctl backtest --input`.
-func exportPairsSignals(results []pairs.SimulationResult) error {
+func exportPairsSignals(results []pairResult) error {
 	if len(results) == 0 {
 		logf("No trades to export.\n")
 		return nil

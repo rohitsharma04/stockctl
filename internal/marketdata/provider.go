@@ -46,11 +46,11 @@ const (
 // HistoryProvenance reports where data came from and whether the cache was
 // used as a stale fallback after an upstream failure.
 type HistoryProvenance struct {
-	Source        HistorySource
-	FetchedAt     time.Time
-	LastBarDate   time.Time
-	Stale         bool
-	UpstreamError string
+	Source        HistorySource `json:"source"`
+	FetchedAt     time.Time     `json:"fetched_at,omitempty"`
+	LastBarDate   time.Time     `json:"last_bar_date,omitempty"`
+	Stale         bool          `json:"stale,omitempty"`
+	UpstreamError string        `json:"upstream_error,omitempty"`
 }
 
 type HistoryResult struct {

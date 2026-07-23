@@ -10,8 +10,9 @@ import (
 )
 
 var tickersCmd = &cobra.Command{
-	Use:   "tickers",
-	Short: "List the built-in ticker universe for a market",
+	Use:          "tickers",
+	Short:        "List the built-in ticker universe for a market",
+	SilenceUsage: true,
 	Long: `Shows the embedded index constituents for the active market.
 
 Every market has a built-in universe. Use 'stockctl markets' to see all.`,
@@ -30,6 +31,9 @@ type tickersResult struct {
 }
 
 func runTickers(cmd *cobra.Command, args []string) error {
+	if selectedOutputFormat() == output.FormatCSV {
+		return fmt.Errorf("tickers does not support --output csv")
+	}
 	mktID := activeMarket.ID
 
 	tickers, err := marketdata.GetUniverse(mktID)
@@ -43,7 +47,7 @@ func runTickers(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	switch output.Format(appConfig.General.Output) {
+	switch selectedOutputFormat() {
 	case output.FormatJSON:
 		env := output.Envelope{
 			Meta: output.NewMeta("tickers"),
@@ -69,4 +73,3 @@ func runTickers(cmd *cobra.Command, args []string) error {
 
 	return nil
 }
-

@@ -7,10 +7,67 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestClearCacheWithOptionsReturnsRemoveFailure(t *testing.T) {
+	oldRemove := cacheRemove
+	cacheRemove = func(string) error { return errors.New("permission denied") }
+	t.Cleanup(func() { cacheRemove = oldRemove })
+
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cacheDir, "AAPL_5y_1d.gob"), []byte("cache"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	oldCacheDir := cacheDirPath
+	cacheDirPath = func() string { return cacheDir }
+	t.Cleanup(func() { cacheDirPath = oldCacheDir })
+
+	matched, removed, err := ClearCacheWithOptions("", false)
+	if err == nil || !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("ClearCacheWithOptions error = %v, want remove failure", err)
+	}
+	if matched != 1 || removed != 0 {
+		t.Fatalf("matched/removed = %d/%d, want 1/0", matched, removed)
+	}
+}
+
+func TestClearCacheWithOptionsValidatesMarketEvenWhenCacheIsMissing(t *testing.T) {
+	cacheDir := filepath.Join(t.TempDir(), "missing-cache")
+	oldCacheDir := cacheDirPath
+	cacheDirPath = func() string { return cacheDir }
+	t.Cleanup(func() { cacheDirPath = oldCacheDir })
+	_, _, err := ClearCacheWithOptions("not-a-market", true)
+	if err == nil || !strings.Contains(err.Error(), "unknown market") {
+		t.Fatalf("market validation error = %v", err)
+	}
+}
+
+func TestReadCacheEntryRejectsStructurallyInvalidEntry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "INVALID_5y_1d.gob")
+	seedDiskCacheEntry(t, path, diskCacheEntry{OrigPeriod: "5y", Data: []OHLCV{{Close: 10}}})
+	if _, _, err := ReadCacheEntry(path); err == nil || !strings.Contains(err.Error(), "bar has no date") {
+		t.Fatalf("ReadCacheEntry error = %v, want structural date validation", err)
+	}
+}
+
+func TestGetCacheStatsVerifyCountsStructurallyInvalidEntryAsCorrupt(t *testing.T) {
+	cacheDir := t.TempDir()
+	seedDiskCacheEntry(t, filepath.Join(cacheDir, "INVALID_5y_1d.gob"), diskCacheEntry{OrigPeriod: "5y", Data: []OHLCV{{Close: 10}}})
+	oldCacheDir := cacheDirPath
+	cacheDirPath = func() string { return cacheDir }
+	t.Cleanup(func() { cacheDirPath = oldCacheDir })
+	stats := GetCacheStats(true)
+	if stats.TotalFiles != 1 || stats.Decodable != 0 || stats.Corrupt != 1 {
+		t.Fatalf("stats = %#v, want one structurally corrupt entry", stats)
+	}
+}
 
 func TestDiskCache_DeltaFetchMerge(t *testing.T) {
 	// Setup: temp dir, mock provider

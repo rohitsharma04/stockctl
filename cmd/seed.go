@@ -5,15 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/rohitsharma04/stockctl/internal/config"
 	"github.com/rohitsharma04/stockctl/internal/marketdata"
+	"github.com/rohitsharma04/stockctl/internal/output"
 	"github.com/spf13/cobra"
 )
 
@@ -45,12 +48,14 @@ type seedCheckpoint struct {
 }
 
 type seedSummary struct {
+	RunID     string    `json:"run_id"`
 	Started   time.Time `json:"started"`
 	Finished  time.Time `json:"finished"`
 	Markets   []string  `json:"markets"`
 	Period    string    `json:"requested_period"`
 	Coverage  string    `json:"coverage_intent"`
 	Total     int       `json:"total"`
+	Attempted int       `json:"attempted"`
 	Succeeded int       `json:"succeeded"`
 	Failed    int       `json:"failed"`
 	Pending   int       `json:"pending"`
@@ -60,6 +65,52 @@ type seedSummary struct {
 	Stale     int       `json:"stale_cache,omitempty"`
 }
 
+type seedFailure struct {
+	Ticker    string    `json:"ticker"`
+	Status    string    `json:"status"`
+	Attempts  int       `json:"attempts"`
+	LastError string    `json:"last_error,omitempty"`
+	NextRetry time.Time `json:"next_retry,omitempty"`
+}
+
+type seedHistoryResult struct {
+	Summary  seedSummary   `json:"summary"`
+	Failures []seedFailure `json:"failures"`
+}
+
+// seedHistoryIncompleteError marks a JSON envelope that seed history already
+// wrote. The root must preserve that command-owned envelope verbatim.
+type seedHistoryIncompleteError struct {
+	err    error
+	result seedHistoryResult
+}
+
+func (e *seedHistoryIncompleteError) Error() string            { return e.err.Error() }
+func (e *seedHistoryIncompleteError) Unwrap() error            { return e.err }
+func (e *seedHistoryIncompleteError) JSONResults() interface{} { return e.result }
+func (e *seedHistoryIncompleteError) OutputWritten() bool      { return true }
+
+var ErrSeedAlreadyRunning = errors.New("seed already running")
+
+func acquireSeedRunLease(stateFile string) (func(), error) {
+	lockPath := stateFile + ".lock"
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		if err == syscall.EWOULDBLOCK || err == syscall.EAGAIN {
+			return nil, fmt.Errorf("%w: %s", ErrSeedAlreadyRunning, lockPath)
+		}
+		return nil, err
+	}
+	return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() }, nil
+}
+
 // seedProviderFactory is a seam for command tests. Production code always uses
 // the rate-aware provider builder.
 var seedProviderFactory = func(noCache bool, rps int) marketdata.Provider {
@@ -67,9 +118,160 @@ var seedProviderFactory = func(noCache bool, rps int) marketdata.Provider {
 }
 
 func newSeedCmd() *cobra.Command {
-	seedCmd := &cobra.Command{Use: "seed", Short: "Populate local market-data cache"}
-	seedCmd.AddCommand(newSeedHistoryCmd())
+	seedCmd := &cobra.Command{
+		Use:   "seed",
+		Short: "Populate local market-data cache",
+		Long: `Populate and verify durable daily-history cache data.
+
+stockctl owns checkpointing, retries, rate limiting, resume behavior, and
+cache writes. Hermes only schedules, launches, and supervises delivery.
+
+Canonical workflow:
+  stockctl seed history --market us --period max --output json --quiet
+  stockctl seed status --output json --quiet
+  stockctl seed verify --market us --period max --output json --quiet
+  stockctl cache stats --verify --output json --quiet
+  stockctl cache clear --yes`,
+	}
+	seedCmd.AddCommand(newSeedHistoryCmd(), newSeedStatusCmd(), newSeedVerifyCmd())
 	return seedCmd
+}
+
+func newSeedStatusCmd() *cobra.Command {
+	var stateFile string
+	cmd := &cobra.Command{Use: "status", Short: "Show seed checkpoint status", Long: "Show the stockctl-owned durable seed checkpoint. Use after `seed history` to inspect resumable work:\n  stockctl seed status --output json --quiet", SilenceUsage: true, SilenceErrors: true, RunE: func(cmd *cobra.Command, args []string) error {
+		if stateFile == "" {
+			stateFile = filepath.Join(config.StockctlDir(), "seed-history-state.json")
+		}
+		if _, err := os.Stat(stateFile); os.IsNotExist(err) {
+			return writeSeedResult(cmd, "seed-status", map[string]interface{}{"status": "not_found", "state_file": stateFile})
+		} else if err != nil {
+			return err
+		}
+		state, err := loadSeedCheckpoint(stateFile)
+		if err != nil {
+			return err
+		}
+		counts := map[string]int{}
+		due := 0
+		var oldest time.Time
+		samples := make([]seedFailure, 0, 20)
+		now := time.Now()
+		tickers := make([]string, 0, len(state.Tickers))
+		for ticker := range state.Tickers {
+			tickers = append(tickers, ticker)
+		}
+		sort.Strings(tickers)
+		for _, ticker := range tickers {
+			st := state.Tickers[ticker]
+			counts[st.Status]++
+			if st.Status != "success" && (st.NextRetry.IsZero() || !st.NextRetry.After(now)) {
+				due++
+			}
+			if st.Status != "success" && (oldest.IsZero() || st.CreatedAt.Before(oldest)) {
+				oldest = st.CreatedAt
+			}
+			if st.Status != "success" && len(samples) < 20 {
+				samples = append(samples, seedFailure{Ticker: ticker, Status: st.Status, Attempts: st.Attempts, LastError: st.LastError, NextRetry: st.NextRetry})
+			}
+		}
+		return writeSeedResult(cmd, "seed-status", map[string]interface{}{"status": "ok", "state_file": stateFile, "version": state.Version, "period": state.Period, "coverage": state.Coverage, "markets": state.Markets, "updated_at": state.Updated, "counts": counts, "due_retry": due, "oldest_pending": oldest, "failures": samples})
+	}}
+	cmd.Flags().StringVar(&stateFile, "state-file", "", "checkpoint JSON file")
+	return cmd
+}
+
+func newSeedVerifyCmd() *cobra.Command {
+	var markets []string
+	var stateFile, period string
+	cmd := &cobra.Command{Use: "verify", Short: "Verify seeded cache entries without Yahoo calls", Long: "Verify stockctl-managed seed cache entries locally, without Yahoo calls. Run after seed history:\n  stockctl seed verify --market us --period max --output json --quiet", SilenceUsage: true, SilenceErrors: true, RunE: func(cmd *cobra.Command, args []string) error {
+		if len(markets) == 0 {
+			return errors.New("at least one --market (india or us) is required")
+		}
+		markets = uniqueStrings(markets)
+		sort.Strings(markets)
+		if period == "" {
+			period = defaultSeedHistoryPeriod
+		}
+		if !isSupportedSeedPeriod(period) {
+			return fmt.Errorf("unsupported --period %q", period)
+		}
+		for _, market := range markets {
+			if market != "india" && market != "us" {
+				return fmt.Errorf("unsupported seed market %q (allowed: india, us)", market)
+			}
+		}
+		valid, missing, corrupt := 0, 0, 0
+		tickers, err := seedTickers(markets)
+		if err != nil {
+			return err
+		}
+		details := make([]seedFailure, 0)
+		for _, ticker := range tickers {
+			data, _, err := marketdata.ReadCacheEntry(filepath.Join(marketdata.CacheDir(), marketdata.CacheFilename(ticker, period, "1d")))
+			if os.IsNotExist(err) {
+				missing++
+				details = append(details, seedFailure{Ticker: ticker, Status: "missing"})
+				continue
+			}
+			if err != nil || validateSeedHistory(data, period) != nil {
+				corrupt++
+				msg := "invalid cache"
+				if err != nil {
+					msg = err.Error()
+				}
+				details = append(details, seedFailure{Ticker: ticker, Status: "corrupt", LastError: msg})
+				continue
+			}
+			valid++
+		}
+		return writeSeedResult(cmd, "seed-verify", map[string]interface{}{"state_file": stateFile, "markets": markets, "period": period, "valid": valid, "missing": missing, "corrupt": corrupt, "failures": details})
+	}}
+	cmd.Flags().StringSliceVar(&markets, "market", nil, "market to verify (repeatable: india, us; required)")
+	cmd.Flags().StringVar(&stateFile, "state-file", "", "checkpoint JSON file (identity only)")
+	cmd.Flags().StringVar(&period, "period", defaultSeedHistoryPeriod, "cached history period")
+	return cmd
+}
+
+func writeSeedResult(cmd *cobra.Command, command string, result interface{}) error {
+	if selectedOutputFormat() == output.FormatJSON {
+		return output.WriteEnvelope(cmd.OutOrStdout(), output.Envelope{Meta: output.NewMeta(command), Results: result})
+	}
+	if selectedOutputFormat() == output.FormatCSV {
+		return fmt.Errorf("%s does not support --output csv", command)
+	}
+	values, ok := result.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("cannot render %s as a table", command)
+	}
+	switch command {
+	case "seed-status":
+		fmt.Fprintln(cmd.OutOrStdout(), "Seed status")
+		fmt.Fprintf(cmd.OutOrStdout(), "Status: %v\nState file: %v\nPeriod: %v\nCoverage: %v\n", values["status"], values["state_file"], values["period"], values["coverage"])
+		fmt.Fprintln(cmd.OutOrStdout(), "\nStatus counts:")
+		tw := output.NewTableWriter(cmd.OutOrStdout())
+		tw.SetHeaders("Status", "Count")
+		counts, _ := values["counts"].(map[string]int)
+		statuses := make([]string, 0, len(counts))
+		for status := range counts {
+			statuses = append(statuses, status)
+		}
+		sort.Strings(statuses)
+		for _, status := range statuses {
+			tw.AddRow(status, fmt.Sprintf("%d", counts[status]))
+		}
+		tw.Render()
+		fmt.Fprintf(cmd.OutOrStdout(), "Due retry: %v\n", values["due_retry"])
+	case "seed-verify":
+		fmt.Fprintln(cmd.OutOrStdout(), "Seed cache verification")
+		tw := output.NewTableWriter(cmd.OutOrStdout())
+		tw.SetHeaders("Valid", "Missing", "Corrupt")
+		tw.AddRow(fmt.Sprint(values["valid"]), fmt.Sprint(values["missing"]), fmt.Sprint(values["corrupt"]))
+		tw.Render()
+	default:
+		return fmt.Errorf("%s does not support table output", command)
+	}
+	return nil
 }
 
 func newSeedHistoryCmd() *cobra.Command {
@@ -77,8 +279,15 @@ func newSeedHistoryCmd() *cobra.Command {
 	var stateFile, deadline, period string
 	var rate, workers, maxAttempts int
 	cmd := &cobra.Command{
-		Use:           "history",
-		Short:         "Seed daily history into the local cache",
+		Use:   "history",
+		Short: "Seed daily history into the local cache",
+		Long: `Seed durable daily history into the local cache.
+
+stockctl owns the checkpoint, retry, rate-limit, cache, and resume logic. A
+later invocation resumes from the same checkpoint; Hermes only schedules,
+launches, and supervises delivery. Follow with:
+  stockctl seed status --output json --quiet
+  stockctl seed verify --market us --period max --output json --quiet`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -107,6 +316,11 @@ func newSeedHistoryCmd() *cobra.Command {
 			if stateFile == "" {
 				stateFile = filepath.Join(config.StockctlDir(), "seed-history-state.json")
 			}
+			release, err := acquireSeedRunLease(stateFile)
+			if err != nil {
+				return err
+			}
+			defer release()
 			ctx := cmd.Context()
 			if ctx == nil {
 				ctx = context.Background()
@@ -140,7 +354,7 @@ func newSeedHistoryCmd() *cobra.Command {
 				return err
 			}
 			provider := seedProviderFactory(noCache, rate)
-			summary := seedSummary{Started: now, Markets: markets, Period: period, Coverage: seedCoverageIntent(period), Total: len(tickers)}
+			summary := seedSummary{RunID: fmt.Sprintf("seed-%d", now.UnixNano()), Started: now, Markets: markets, Period: period, Coverage: seedCoverageIntent(period), Total: len(tickers)}
 			interrupted := false
 			for _, ticker := range tickers {
 				if interrupted {
@@ -163,6 +377,7 @@ func newSeedHistoryCmd() *cobra.Command {
 						break
 					}
 					st.Attempts++
+					summary.Attempted++
 					st.UpdatedAt = time.Now().UTC()
 					err := seedGetHistory(ctx, provider, ticker, period, &summary)
 					if err == nil {
@@ -219,11 +434,28 @@ func newSeedHistoryCmd() *cobra.Command {
 					summary.Pending++
 				}
 			}
-			if err := json.NewEncoder(cmd.OutOrStdout()).Encode(summary); err != nil {
-				return err
+			failures := seedFailures(tickers, checkpoint)
+			meta := output.NewMeta("seed-history")
+			meta.DurationMs = summary.Finished.Sub(summary.Started).Milliseconds()
+			result := seedHistoryResult{Summary: summary, Failures: failures}
+			incomplete := summary.Failed > 0 || summary.Pending > 0
+			incompleteErr := fmt.Errorf("seed incomplete: %d failed, %d pending", summary.Failed, summary.Pending)
+			if selectedOutputFormat() == output.FormatJSON {
+				env := output.Envelope{Meta: meta, Results: result}
+				if incomplete {
+					env.Errors = []output.ErrorInfo{{Error: incompleteErr.Error()}}
+				}
+				if err := output.WriteEnvelope(cmd.OutOrStdout(), env); err != nil {
+					return err
+				}
+				if incomplete {
+					return &seedHistoryIncompleteError{err: incompleteErr, result: result}
+				}
+				return nil
 			}
-			if summary.Failed > 0 || summary.Pending > 0 {
-				return fmt.Errorf("seed incomplete: %d failed, %d pending", summary.Failed, summary.Pending)
+			writeSeedHistoryText(cmd.OutOrStdout(), result)
+			if incomplete {
+				return incompleteErr
 			}
 			return nil
 		},
@@ -236,6 +468,24 @@ func newSeedHistoryCmd() *cobra.Command {
 	cmd.Flags().IntVar(&workers, "workers", 1, "workers (only 1 is currently supported)")
 	cmd.Flags().IntVar(&maxAttempts, "max-attempts", 3, "maximum attempts per ticker")
 	return cmd
+}
+
+func writeSeedHistoryText(w io.Writer, result seedHistoryResult) {
+	s := result.Summary
+	fmt.Fprintln(w, "Seed history summary")
+	fmt.Fprintf(w, "Markets: %s\nPeriod: %s\n", strings.Join(s.Markets, ", "), s.Period)
+	fmt.Fprintf(w, "Total: %d  Attempted: %d  Succeeded: %d  Failed: %d  Pending: %d  Retries: %d\n", s.Total, s.Attempted, s.Succeeded, s.Failed, s.Pending, s.Retries)
+	if len(result.Failures) == 0 {
+		return
+	}
+	fmt.Fprintln(w, "Incomplete entries:")
+	for _, failure := range result.Failures {
+		if failure.LastError == "" {
+			fmt.Fprintf(w, "  %s: %s (attempts: %d)\n", failure.Ticker, failure.Status, failure.Attempts)
+			continue
+		}
+		fmt.Fprintf(w, "  %s: %s (attempts: %d; %s)\n", failure.Ticker, failure.Status, failure.Attempts, failure.LastError)
+	}
 }
 
 func seedGetHistory(ctx context.Context, provider marketdata.Provider, ticker, period string, summary *seedSummary) error {
@@ -255,11 +505,55 @@ func seedGetHistory(ctx context.Context, provider marketdata.Provider, ticker, p
 				}
 				return errors.New("stale cache fallback")
 			}
+			if err = validateSeedHistory(result.Data, period); err != nil {
+				return err
+			}
 		}
 		return err
 	}
-	_, err := provider.GetHistory(ctx, ticker, period, "1d")
-	return err
+	data, err := provider.GetHistory(ctx, ticker, period, "1d")
+	if err != nil {
+		return err
+	}
+	return validateSeedHistory(data, period)
+}
+
+func validateSeedHistory(data []marketdata.OHLCV, period string) error {
+	if len(data) == 0 {
+		return errors.New("seed history is empty")
+	}
+	var previous time.Time
+	for i, bar := range data {
+		if bar.Date.IsZero() {
+			return fmt.Errorf("seed history has invalid date at index %d", i)
+		}
+		day := time.Date(bar.Date.Year(), bar.Date.Month(), bar.Date.Day(), 0, 0, 0, 0, bar.Date.Location())
+		if i > 0 && !day.After(previous) {
+			return fmt.Errorf("seed history dates are not strictly ascending")
+		}
+		previous = day
+	}
+	if period == "5y" || period == "10y" {
+		start := time.Now().AddDate(-map[string]int{"5y": 5, "10y": 10}[period], 0, 0)
+		if data[0].Date.After(start) {
+			return fmt.Errorf("seed history does not cover requested %s period", period)
+		}
+	}
+	return nil
+}
+
+func seedFailures(tickers []string, checkpoint *seedCheckpoint) []seedFailure {
+	failures := make([]seedFailure, 0)
+	for _, ticker := range tickers {
+		st := checkpoint.Tickers[ticker]
+		if st != nil && st.Status != "success" {
+			failures = append(failures, seedFailure{Ticker: ticker, Status: st.Status, Attempts: st.Attempts, LastError: st.LastError, NextRetry: st.NextRetry})
+		}
+	}
+	if len(failures) > 100 {
+		return failures[:100]
+	}
+	return failures
 }
 
 func seedTickers(markets []string) ([]string, error) {

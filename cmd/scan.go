@@ -593,6 +593,7 @@ func fetchScanSnapshot(ctx context.Context, tickers []string, provider marketdat
 				Code:    "benchmark_missing",
 				Message: fmt.Sprintf("Could not fetch benchmark %s: %v", benchmarkSymbol, err),
 			})
+			snapshot.errors = append(snapshot.errors, output.ErrorInfo{Ticker: benchmarkSymbol, Error: err.Error()})
 		} else if !asOfDate.IsZero() {
 			benchmarkResult.Data, err = marketdata.TruncateAt(benchmarkResult.Data, asOfDate)
 			if err != nil {
@@ -615,7 +616,7 @@ func fetchScanSnapshot(ctx context.Context, tickers []string, provider marketdat
 	tickerData, provenance, errors, breadthData, upstreamFailures := fetchTickerSnapshotData(ctx, tickers, provider, workers, asOfDate)
 	snapshot.tickerData = tickerData
 	snapshot.tickerProvenance = provenance
-	snapshot.errors = errors
+	snapshot.errors = append(snapshot.errors, errors...)
 	snapshot.breadthData = breadthData
 	snapshot.upstreamFailures = upstreamFailures
 	return snapshot, warnings

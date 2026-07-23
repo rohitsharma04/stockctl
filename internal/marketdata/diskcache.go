@@ -39,9 +39,16 @@ type diskCacheEntry struct {
 
 const tailFetchPeriod = "5d"
 
+// These seams keep filesystem failures observable in focused contract tests.
+// Production always uses the standard cache location and os.Remove.
+var (
+	cacheDirPath = func() string { return filepath.Join(config.StockctlDir(), "cache") }
+	cacheRemove  = os.Remove
+)
+
 // NewDiskCachedProvider creates a caching wrapper that persists data to disk.
 func NewDiskCachedProvider(inner Provider) *DiskCachedProvider {
-	cacheDir := filepath.Join(config.StockctlDir(), "cache")
+	cacheDir := cacheDirPath()
 	os.MkdirAll(cacheDir, 0755)
 	return &DiskCachedProvider{
 		inner:    inner,
@@ -53,6 +60,11 @@ func diskCacheFilename(symbol, period, interval string) string {
 	// Sanitize symbol for filesystem (replace . ^ / with _)
 	safe := strings.NewReplacer(".", "_", "^", "_", "/", "_", ":", "_").Replace(symbol)
 	return fmt.Sprintf("%s_%s_%s.gob", safe, period, interval)
+}
+
+// CacheFilename returns the on-disk cache filename for an entry.
+func CacheFilename(symbol, period, interval string) string {
+	return diskCacheFilename(symbol, period, interval)
 }
 
 // deltaPeriod returns the fixed overlap/tail range used after an initial
@@ -471,11 +483,14 @@ type CacheStats struct {
 	TotalBytes int64  `json:"total_bytes"`
 	OldestFile string `json:"oldest_file,omitempty"`
 	NewestFile string `json:"newest_file,omitempty"`
+	Decodable  int    `json:"decodable,omitempty"`
+	Corrupt    int    `json:"corrupt,omitempty"`
+	LockFiles  int    `json:"lock_files,omitempty"`
 }
 
 // GetCacheStats returns statistics about the disk cache.
-func GetCacheStats() CacheStats {
-	cacheDir := filepath.Join(config.StockctlDir(), "cache")
+func GetCacheStats(verify ...bool) CacheStats {
+	cacheDir := cacheDirPath()
 	stats := CacheStats{CacheDir: cacheDir}
 
 	entries, err := os.ReadDir(cacheDir)
@@ -485,7 +500,14 @@ func GetCacheStats() CacheStats {
 
 	var oldestTime, newestTime time.Time
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".gob") {
+		if e.IsDir() {
+			continue
+		}
+		if strings.HasSuffix(e.Name(), ".lock") {
+			stats.LockFiles++
+			continue
+		}
+		if !strings.HasSuffix(e.Name(), ".gob") {
 			continue
 		}
 		stats.TotalFiles++
@@ -494,6 +516,13 @@ func GetCacheStats() CacheStats {
 			continue
 		}
 		stats.TotalBytes += info.Size()
+		if len(verify) > 0 && verify[0] {
+			if _, _, err := ReadCacheEntry(filepath.Join(cacheDir, e.Name())); err != nil {
+				stats.Corrupt++
+			} else {
+				stats.Decodable++
+			}
+		}
 
 		if oldestTime.IsZero() || info.ModTime().Before(oldestTime) {
 			oldestTime = info.ModTime()
@@ -508,19 +537,61 @@ func GetCacheStats() CacheStats {
 	return stats
 }
 
+// ReadCacheEntry decodes a cache entry without refreshing or modifying it.
+func ReadCacheEntry(path string) ([]OHLCV, string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, "", err
+	}
+	defer f.Close()
+	var entry diskCacheEntry
+	if err := gob.NewDecoder(f).Decode(&entry); err != nil {
+		return nil, "", err
+	}
+	if entry.OrigPeriod == "" {
+		return nil, "", fmt.Errorf("invalid cache entry: missing original period")
+	}
+	if len(entry.Data) == 0 {
+		return nil, "", fmt.Errorf("invalid cache entry: no bars")
+	}
+	for _, bar := range entry.Data {
+		if bar.Date.IsZero() {
+			return nil, "", fmt.Errorf("invalid cache entry: bar has no date")
+		}
+	}
+	return entry.Data, entry.OrigPeriod, nil
+}
+
+func CacheDir() string { return cacheDirPath() }
+
 // ClearCache removes all cached files. If market is non-empty, only clears
 // files matching that market's suffix pattern.
 func ClearCache(market string) (int, error) {
-	cacheDir := filepath.Join(config.StockctlDir(), "cache")
+	_, removed, err := ClearCacheWithOptions(market, false)
+	return removed, err
+}
+
+// ClearCacheWithOptions reports matching and removed cache files. It never
+// considers advisory lock files for removal.
+func ClearCacheWithOptions(market string, dryRun bool) (int, int, error) {
+	var suffix string
+	if market != "" {
+		mkt, ok := Markets[market]
+		if !ok {
+			return 0, 0, fmt.Errorf("unknown market: %s", market)
+		}
+		suffix = strings.ReplaceAll(mkt.Suffix, ".", "_")
+	}
+	cacheDir := cacheDirPath()
 	entries, err := os.ReadDir(cacheDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return 0, nil
+			return 0, 0, nil
 		}
-		return 0, err
+		return 0, 0, err
 	}
 
-	removed := 0
+	matched, removed := 0, 0
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".gob") {
 			continue
@@ -528,20 +599,19 @@ func ClearCache(market string) (int, error) {
 
 		if market != "" {
 			// Only clear files matching market suffix
-			mkt, ok := Markets[market]
-			if !ok {
-				return 0, fmt.Errorf("unknown market: %s", market)
-			}
-			suffix := strings.ReplaceAll(mkt.Suffix, ".", "_")
 			if suffix != "" && !strings.Contains(e.Name(), suffix) {
 				continue
 			}
 		}
+		matched++
 
-		if err := os.Remove(filepath.Join(cacheDir, e.Name())); err == nil {
+		if !dryRun {
+			if err := cacheRemove(filepath.Join(cacheDir, e.Name())); err != nil {
+				return matched, removed, fmt.Errorf("removing cache entry %s: %w", e.Name(), err)
+			}
 			removed++
 		}
 	}
 
-	return removed, nil
+	return matched, removed, nil
 }

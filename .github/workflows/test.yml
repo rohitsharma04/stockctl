@@ -18,9 +18,18 @@ jobs:
         with:
           go-version: "1.25.5"
           cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install automation test dependencies
+        run: python3 -m pip install -r requirements-market-brief.txt
       - name: Test
         run: go test -race ./...
+      - name: Vet
+        run: go vet ./...
       - name: Build
         run: go build -o bin/stockctl .
       - name: Verify Hermes launcher syntax
         run: python3 -m py_compile automation/stockctl_weekend_seed.py
+      - name: Test automation
+        run: python3 -m unittest automation/test_market_morning_brief.py

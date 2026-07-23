@@ -11,8 +11,9 @@ import (
 )
 
 var quoteCmd = &cobra.Command{
-	Use:   "quote [tickers...]",
-	Short: "Fetch real-time quotes for one or more tickers",
+	Use:          "quote [tickers...]",
+	Short:        "Fetch real-time quotes for one or more tickers",
+	SilenceUsage: true,
 	Long: `Fetch the latest price and volume for one or more stock tickers.
 
 Examples:
@@ -33,6 +34,9 @@ type quoteResult struct {
 }
 
 func runQuote(cmd *cobra.Command, args []string) error {
+	if selectedOutputFormat() == output.FormatCSV {
+		return fmt.Errorf("quote does not support --output csv")
+	}
 	ctx := rootCtx
 	startTime := time.Now()
 	provider := marketdata.BuildProvider(noCache)
@@ -60,7 +64,7 @@ func runQuote(cmd *cobra.Command, args []string) error {
 		})
 	}
 
-	switch output.Format(appConfig.General.Output) {
+	switch selectedOutputFormat() {
 	case output.FormatJSON:
 		meta := output.NewMeta("quote")
 		meta.Market = activeMarket.ID

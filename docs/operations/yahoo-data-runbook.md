@@ -19,14 +19,14 @@ python3 -m py_compile automation/stockctl_weekend_seed.py
 Use a dedicated state file if you want an explicit run boundary. Re-running the same command resumes successful, pending, and due-retry ticker state without refetching completed tickers.
 
 ```bash
-bin/stockctl --quiet seed history \
+bin/stockctl --quiet --output json seed history \
   --market india --market us \
   --period max \
   --rate 1 --workers 1 --max-attempts 3 --deadline 6h \
   --state-file ~/.stockctl/seed-history-state.json
 ```
 
-Exit status is non-zero when any ticker is terminally failed or remains pending at the deadline. Stdout is one JSON summary; progress and CLI usage are suppressed in quiet mode.
+Exit status is non-zero when any ticker is terminally failed or remains pending at the deadline. Stdout is one JSON envelope (`results.summary` and `results.failures`); progress and CLI usage are suppressed in quiet mode. A state-file lease ensures only one seed owner can run at a time.
 
 The checkpoint stores the requested history period and coverage identity. Version 1
 and version 2 checkpoints are treated as incompatible legacy checkpoints; the
@@ -36,16 +36,9 @@ work so old successes do not hide missing full-history cache entries.
 ## Inspect checkpoint state
 
 ```bash
-python3 - <<'PY'
-import json
-from pathlib import Path
-p = Path.home() / '.stockctl' / 'seed-history-state.json'
-s = json.loads(p.read_text())
-counts = {}
-for item in s['tickers'].values():
-    counts[item['status']] = counts.get(item['status'], 0) + 1
-print({'updated_at': s.get('updated_at'), 'markets': s.get('markets'), 'period': s.get('period'), 'counts': counts})
-PY
+bin/stockctl --output json seed status --state-file ~/.stockctl/seed-history-state.json
+bin/stockctl --output json seed verify --market india --market us --period max
+bin/stockctl --output json cache stats --verify
 ```
 
 Statuses:
@@ -59,11 +52,7 @@ Statuses:
 
 1. **429 / network outage:** let the next scheduled run resume. Do not delete the checkpoint or start concurrent manual runs.
 2. **Deadline:** increase `--deadline` only after confirming no other provider-intensive job is running. Interrupted work remains `pending`.
-3. **Terminal ticker error:** inspect its `last_error`. To retry only after deliberate review, edit or remove that ticker's state entry while preserving the rest of the checkpoint. Back up first:
-
-   ```bash
-   cp ~/.stockctl/seed-history-state.json ~/.stockctl/seed-history-state.backup.json
-   ```
+3. **Terminal ticker error:** inspect `seed status` and `seed verify`. Preserve the checkpoint and cache files for diagnosis; do not edit state JSON. Escalate with the checkpoint and failure details to the maintainer before a deliberate state reset is introduced.
 
 4. **Corrupt checkpoint:** preserve the corrupt file for diagnosis, then move it aside. A new seed rebuilds state but may re-check all symbols:
 

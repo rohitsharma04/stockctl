@@ -2,9 +2,20 @@ package output
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"time"
 )
+
+// ParseFormat validates the small set of formats supported by the CLI.
+func ParseFormat(value string) (Format, error) {
+	switch Format(value) {
+	case FormatTable, FormatJSON, FormatCSV:
+		return Format(value), nil
+	default:
+		return "", fmt.Errorf("unsupported output format %q (allowed: table, json, csv)", value)
+	}
+}
 
 // Envelope wraps all JSON output in a standard structure for agent consumption.
 type Envelope struct {

@@ -8,11 +8,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/rohitsharma04/stockctl/internal/marketdata"
+	"github.com/rohitsharma04/stockctl/internal/output"
 	"github.com/spf13/cobra"
 )
 
@@ -77,7 +79,14 @@ func (p *seedTestProvider) GetHistory(ctx context.Context, symbol, period, inter
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return nil, p.err
+	if p.err != nil {
+		return nil, p.err
+	}
+	start := time.Now().UTC().AddDate(-1, 0, 0)
+	if period == "5y" || period == "10y" {
+		start = time.Now().UTC().AddDate(-11, 0, 0)
+	}
+	return []marketdata.OHLCV{{Date: start, Close: 100}, {Date: time.Now().UTC(), Close: 101}}, nil
 }
 
 func TestSeedHistoryDefaultPeriodMaxPassesThroughToHistoryProvider(t *testing.T) {
@@ -173,23 +182,122 @@ func (p *seedTestProvider) GetQuote(context.Context, string) (*marketdata.Quote,
 
 func decodeSingleSeedSummary(t *testing.T, stdout []byte) seedSummary {
 	t.Helper()
-	var summary seedSummary
+	var envelope struct {
+		Meta    output.Meta `json:"meta"`
+		Results struct {
+			Summary seedSummary `json:"summary"`
+		} `json:"results"`
+	}
 	dec := json.NewDecoder(bytes.NewReader(stdout))
-	if decodeErr := dec.Decode(&summary); decodeErr != nil {
-		t.Fatalf("stdout must contain a parseable JSON summary, got %q: %v", string(stdout), decodeErr)
+	if decodeErr := dec.Decode(&envelope); decodeErr != nil {
+		t.Fatalf("stdout must contain a parseable JSON envelope, got %q: %v", string(stdout), decodeErr)
+	}
+	if envelope.Meta.Command != "seed-history" {
+		t.Fatalf("command = %q", envelope.Meta.Command)
 	}
 	var extra json.RawMessage
 	if decodeErr := dec.Decode(&extra); !errors.Is(decodeErr, io.EOF) {
 		t.Fatalf("stdout must contain exactly one JSON value, got %q", string(stdout))
 	}
-	return summary
+	return envelope.Results.Summary
+}
+
+func TestValidateSeedHistory(t *testing.T) {
+	now := time.Now().UTC()
+	cases := []struct {
+		name, period string
+		data         []marketdata.OHLCV
+		wantErr      bool
+	}{
+		{"empty", "max", nil, true},
+		{"duplicate", "max", []marketdata.OHLCV{{Date: now}, {Date: now}}, true},
+		{"unordered", "max", []marketdata.OHLCV{{Date: now}, {Date: now.AddDate(0, 0, -1)}}, true},
+		{"undercovered", "5y", []marketdata.OHLCV{{Date: now.AddDate(-4, 0, 0)}, {Date: now}}, true},
+		{"sparse-valid", "5y", []marketdata.OHLCV{{Date: now.AddDate(-5, 0, -1)}, {Date: now}}, false},
+		{"max-valid", "max", []marketdata.OHLCV{{Date: now.AddDate(-1, 0, 0)}, {Date: now}}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateSeedHistory(tc.data, tc.period); (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v", err)
+			}
+		})
+	}
+}
+
+func TestSeedRunLeaseRejectsSecondOwner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	release, err := acquireSeedRunLease(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	_, err = acquireSeedRunLease(path)
+	if !errors.Is(err, ErrSeedAlreadyRunning) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestSeedStatusMissingStateIsSuccessful(t *testing.T) {
+	command := newSeedStatusCmd()
+	var stdout bytes.Buffer
+	command.SetOut(&stdout)
+	command.SetArgs([]string{"--state-file", filepath.Join(t.TempDir(), "missing.json")})
+	if err := command.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "not_found") {
+		t.Fatalf("status output = %s", stdout.String())
+	}
+}
+
+func TestSeedStatusHonorsTableAndJSONOutputContractsThroughRoot(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	now := time.Now().UTC()
+	if err := saveSeedCheckpoint(stateFile, &seedCheckpoint{Version: seedStateVersion, Period: "max", Coverage: seedHistoryCoverage, Tickers: map[string]*seedTickerState{
+		"GOOD": {Status: "success", CreatedAt: now, UpdatedAt: now},
+		"BAD":  {Status: "failed", Attempts: 1, LastError: "unavailable", CreatedAt: now, UpdatedAt: now},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	oldOutput := outputFmt
+	t.Cleanup(func() { outputFmt = oldOutput })
+	for _, format := range []string{"table", "json"} {
+		t.Run(format, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			rootCmd.SetOut(&stdout)
+			rootCmd.SetErr(&stderr)
+			rootCmd.SetArgs([]string{"--output", format, "seed", "status", "--state-file", stateFile})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatal(err)
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("stderr = %q", stderr.String())
+			}
+			if format == "table" {
+				if strings.HasPrefix(strings.TrimSpace(stdout.String()), "{") || !strings.Contains(stdout.String(), "Seed status") || !strings.Contains(stdout.String(), "failed") {
+					t.Fatalf("table output = %q", stdout.String())
+				}
+				return
+			}
+			var env output.Envelope
+			if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+				t.Fatalf("JSON output is not an envelope: %v", err)
+			}
+			if env.Meta.Command != "seed-status" || env.Results == nil {
+				t.Fatalf("envelope = %#v", env)
+			}
+		})
+	}
 }
 
 func executeSeedHistoryForTest(t *testing.T, provider marketdata.Provider, args ...string) (seedSummary, string, error) {
 	t.Helper()
-	old := seedProviderFactory
+	old, oldOutput, oldResolved := seedProviderFactory, outputFmt, outputResolved
 	seedProviderFactory = func(bool, int) marketdata.Provider { return provider }
-	defer func() { seedProviderFactory = old }()
+	outputFmt, outputResolved = "json", false
+	defer func() { seedProviderFactory, outputFmt, outputResolved = old, oldOutput, oldResolved }()
 
 	command := newSeedHistoryCmd()
 	var stdout, stderr bytes.Buffer
@@ -308,6 +416,66 @@ func TestSeedHistoryQuietJSONIncompleteEmitsSingleSummary(t *testing.T) {
 	tickers, _ := seedTickers([]string{"us"})
 	if summary.Failed != len(tickers) || summary.Pending != 0 {
 		t.Fatalf("summary = %#v, want failed incomplete summary", summary)
+	}
+}
+
+func TestExecuteRootSeedHistoryQuietJSONIncompleteWritesOneErrorEnvelopeWithSummary(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	provider := &seedTestProvider{calls: map[string]int{}, err: errors.New("fixture unavailable")}
+	oldFactory, oldOutput, oldQuiet := seedProviderFactory, outputFmt, quiet
+	t.Cleanup(func() { seedProviderFactory, outputFmt, quiet = oldFactory, oldOutput, oldQuiet })
+	seedProviderFactory = func(bool, int) marketdata.Provider { return provider }
+	var stdout, stderr bytes.Buffer
+	rootCmd.SetOut(&stdout)
+	rootCmd.SetErr(&stderr)
+	rootCmd.SetArgs([]string{"--quiet", "--output", "json", "seed", "history", "--market", "us", "--state-file", stateFile, "--max-attempts", "1"})
+	if err := executeRoot(rootCmd, &stdout, &stderr); err == nil {
+		t.Fatal("expected incomplete seed error")
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+	var env struct {
+		Meta    output.Meta `json:"meta"`
+		Results struct {
+			Summary  seedSummary   `json:"summary"`
+			Failures []seedFailure `json:"failures"`
+		} `json:"results"`
+		Errors []output.ErrorInfo `json:"errors"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(stdout.Bytes()))
+	if err := dec.Decode(&env); err != nil {
+		t.Fatalf("JSON envelope = %q: %v", stdout.String(), err)
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		t.Fatalf("expected exactly one JSON envelope, got %q", stdout.String())
+	}
+	if env.Meta.Command != "seed-history" || env.Results.Summary.Failed == 0 || len(env.Results.Failures) == 0 || len(env.Errors) != 1 {
+		t.Fatalf("incomplete seed error envelope = %#v", env)
+	}
+}
+
+func TestExecuteRootSeedHistoryQuietTableIncompleteWritesTextAndOneDiagnostic(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	provider := &seedTestProvider{calls: map[string]int{}, err: errors.New("fixture unavailable")}
+	oldFactory, oldOutput, oldQuiet, oldResolved := seedProviderFactory, outputFmt, quiet, outputResolved
+	t.Cleanup(func() {
+		seedProviderFactory, outputFmt, quiet, outputResolved = oldFactory, oldOutput, oldQuiet, oldResolved
+	})
+	seedProviderFactory = func(bool, int) marketdata.Provider { return provider }
+	var stdout, stderr bytes.Buffer
+	rootCmd.SetOut(&stdout)
+	rootCmd.SetErr(&stderr)
+	rootCmd.SetArgs([]string{"--quiet", "--output", "table", "seed", "history", "--market", "us", "--state-file", stateFile, "--max-attempts", "1"})
+	if err := executeRoot(rootCmd, &stdout, &stderr); err == nil {
+		t.Fatal("expected incomplete seed error")
+	}
+	if strings.HasPrefix(strings.TrimSpace(stdout.String()), "{") || !strings.Contains(stdout.String(), "Seed history summary") || !strings.Contains(stdout.String(), "Failed: 504") || !strings.Contains(stdout.String(), "MMM: failed") {
+		t.Fatalf("table summary = %q", stdout.String())
+	}
+	if stderr.String() != "Error: seed incomplete: 504 failed, 0 pending\n" {
+		t.Fatalf("stderr = %q", stderr.String())
 	}
 }
 

@@ -25,6 +25,8 @@ var (
 	btStrategy string
 )
 
+var backtestProviderFactory = func(noCache bool) marketdata.Provider { return marketdata.BuildProvider(noCache) }
+
 var backtestCmd = &cobra.Command{
 	Use:   "backtest",
 	Short: "Backtest breakout strategies with TP/SL optimization",
@@ -78,10 +80,11 @@ func runBacktest(cmd *cobra.Command, args []string) error {
 
 	// Load entries — either from strategy scan or CSV file
 	var entries []backtest.BreakoutEntry
+	var strategySnapshot *strategyBacktestDiagnostics
 	if btStrategy != "" {
 		// Strategy mode: run scan internally and construct entries
 		var err error
-		entries, err = buildEntriesFromScan(btStrategy)
+		entries, strategySnapshot, err = buildEntriesFromScanWithSnapshot(btStrategy)
 		if err != nil {
 			return err
 		}
@@ -122,8 +125,12 @@ func runBacktest(cmd *cobra.Command, args []string) error {
 	// JSON output with envelope
 	if appConfig.General.Output == "json" {
 		type btResult struct {
-			Optimized []backtest.TradeResult     `json:"optimized"`
-			Metrics   []backtest.StrategyMetrics `json:"metrics"`
+			Optimized         []backtest.TradeResult     `json:"optimized"`
+			Metrics           []backtest.StrategyMetrics `json:"metrics"`
+			DataQuality       *output.DataQualitySummary `json:"data_quality,omitempty"`
+			FetchErrors       []output.ErrorInfo         `json:"fetch_errors,omitempty"`
+			EntriesConsidered int                        `json:"entries_considered,omitempty"`
+			EntriesUsed       int                        `json:"entries_used,omitempty"`
 		}
 		var metrics []backtest.StrategyMetrics
 		for tp := tpMin; tp <= tpMax+0.001; tp += tpStep {
@@ -136,8 +143,17 @@ func runBacktest(cmd *cobra.Command, args []string) error {
 		}
 		meta.DurationMs = time.Since(startTime).Milliseconds()
 		env := output.Envelope{
-			Meta:    meta,
-			Results: btResult{Optimized: results, Metrics: metrics},
+			Meta: meta,
+			Results: func() btResult {
+				result := btResult{Optimized: results, Metrics: metrics}
+				if strategySnapshot != nil {
+					result.DataQuality = &strategySnapshot.DataQuality
+					result.FetchErrors = strategySnapshot.FetchErrors
+					result.EntriesConsidered = strategySnapshot.EntriesConsidered
+					result.EntriesUsed = strategySnapshot.EntriesUsed
+				}
+				return result
+			}(),
 		}
 		return output.WriteEnvelope(os.Stdout, env)
 	}
@@ -333,13 +349,50 @@ func parseFloatList(s string) []float64 {
 
 // buildEntriesFromScan runs a scan with the given strategy and builds
 // BreakoutEntry objects from the results.
+type strategyBacktestDiagnostics struct {
+	DataQuality       output.DataQualitySummary `json:"data_quality"`
+	FetchErrors       []output.ErrorInfo        `json:"fetch_errors"`
+	EntriesConsidered int                       `json:"entries_considered"`
+	EntriesUsed       int                       `json:"entries_used"`
+}
+
+// strategyBacktestSnapshotError keeps the failed scan's diagnostics available
+// to the root JSON error envelope without changing the command's exit status.
+type strategyBacktestSnapshotError struct {
+	err         error
+	diagnostics strategyBacktestDiagnostics
+}
+
+func (e *strategyBacktestSnapshotError) Error() string { return e.err.Error() }
+func (e *strategyBacktestSnapshotError) Unwrap() error { return e.err }
+func (e *strategyBacktestSnapshotError) JSONResults() interface{} {
+	return e.diagnostics
+}
+
+func strategyBacktestSnapshot(snapshot scanSnapshot, considered, used int) strategyBacktestDiagnostics {
+	quality := snapshot.dataQualitySummary()
+	quality.BenchmarkAvailable = snapshot.benchmarkAvailable
+	quality.BenchmarkBars = len(snapshot.benchmarkData)
+	return strategyBacktestDiagnostics{
+		DataQuality: quality, FetchErrors: append([]output.ErrorInfo(nil), snapshot.errors...),
+		EntriesConsidered: considered, EntriesUsed: used,
+	}
+}
+
+// buildEntriesFromScan preserves the internal helper used by callers that do
+// not need the scan diagnostics.
 func buildEntriesFromScan(strategy string) ([]backtest.BreakoutEntry, error) {
+	entries, _, err := buildEntriesFromScanWithSnapshot(strategy)
+	return entries, err
+}
+
+func buildEntriesFromScanWithSnapshot(strategy string) ([]backtest.BreakoutEntry, *strategyBacktestDiagnostics, error) {
 	ctx := rootCtx
 
 	// Load tickers
 	rawTickers, err := marketdata.GetUniverse(appConfig.General.Market)
 	if err != nil {
-		return nil, fmt.Errorf("no built-in universe for %s: %w", appConfig.General.Market, err)
+		return nil, nil, fmt.Errorf("no built-in universe for %s: %w", appConfig.General.Market, err)
 	}
 
 	tickers := make([]string, len(rawTickers))
@@ -348,7 +401,7 @@ func buildEntriesFromScan(strategy string) ([]backtest.BreakoutEntry, error) {
 	}
 
 	// Create provider (with disk cache + circuit breaker)
-	provider := marketdata.BuildProvider(noCache)
+	provider := backtestProviderFactory(noCache)
 
 	// Get screeners
 	registry := screener.Registry(appConfig)
@@ -360,31 +413,46 @@ func buildEntriesFromScan(strategy string) ([]backtest.BreakoutEntry, error) {
 	} else {
 		s, ok := registry[strategy]
 		if !ok {
-			return nil, fmt.Errorf("unknown strategy: %s", strategy)
+			return nil, nil, fmt.Errorf("unknown strategy: %s", strategy)
 		}
 		screeners = append(screeners, s)
 	}
 
-	// Fetch benchmark
+	// Fetch the universe once and share its immutable snapshot among strategies.
 	logf("📊 Scanning %d tickers with %s for backtest...\n", len(tickers), strategy)
-	benchmark, _ := provider.GetHistory(ctx, activeMarket.Benchmark, "5y", "1d")
-
-	// Run scan and build entries
-	var entries []backtest.BreakoutEntry
 	w := appConfig.General.Workers
 	if w <= 0 {
 		w = 8
 	}
+	snapshot, _ := fetchScanSnapshot(ctx, tickers, provider, activeMarket.Benchmark, w, time.Time{})
+	diagnostics := strategyBacktestSnapshot(snapshot, 0, 0)
+	diagnostics.DataQuality.BenchmarkSymbol = activeMarket.Benchmark
+	if !snapshot.benchmarkAvailable {
+		return nil, &diagnostics, &strategyBacktestSnapshotError{
+			err:         fmt.Errorf("backtest strategy requires benchmark data for %s", activeMarket.Benchmark),
+			diagnostics: diagnostics,
+		}
+	}
+	if len(snapshot.errors) > len(tickers)/2 {
+		return nil, &diagnostics, &strategyBacktestSnapshotError{
+			err:         fmt.Errorf("backtest strategy data quality insufficient: %d of %d ticker fetches failed", len(snapshot.errors), len(tickers)),
+			diagnostics: diagnostics,
+		}
+	}
+
+	// Run scan and build entries
+	var entries []backtest.BreakoutEntry
+	considered := 0
 
 	for _, scr := range screeners {
-		results, _, _ := runScreenerV2(ctx, scr, tickers, provider, benchmark, w, time.Time{}, benchmark != nil)
+		results, _, _ := runScreenerFromSnapshot(ctx, scr, tickers, snapshot, w)
 		for _, r := range results {
+			considered++
 			if r.Score < 1.0 {
 				continue // Only fully passing stocks for backtest
 			}
-			// Re-fetch the data (should hit cache) to build the entry
-			data, err := provider.GetHistory(ctx, r.Ticker, "5y", "1d")
-			if err != nil || len(data) < 60 {
+			data := snapshot.tickerData[r.Ticker]
+			if len(data) < 60 {
 				continue
 			}
 
@@ -411,5 +479,7 @@ func buildEntriesFromScan(strategy string) ([]backtest.BreakoutEntry, error) {
 		}
 	}
 
-	return entries, nil
+	diagnostics = strategyBacktestSnapshot(snapshot, considered, len(entries))
+	diagnostics.DataQuality.BenchmarkSymbol = activeMarket.Benchmark
+	return entries, &diagnostics, nil
 }

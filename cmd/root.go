@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/rohitsharma04/stockctl/internal/config"
@@ -15,18 +17,20 @@ import (
 )
 
 var (
-	cfgFile      string
-	outputFmt    string
-	marketID     string
-	verbose      bool
-	quiet        bool
-	noCache      bool
-	timeoutStr   string
-	progressMode string
-	appConfig    *config.Config
-	activeMarket marketdata.Market
-	runDir       string          // unique per-run output directory
-	rootCtx      context.Context // root context, supports --timeout
+	cfgFile           string
+	outputFmt         string
+	marketID          string
+	verbose           bool
+	quiet             bool
+	noCache           bool
+	timeoutStr        string
+	progressMode      string
+	appConfig         *config.Config
+	resolvedOutputFmt output.Format
+	outputResolved    bool
+	activeMarket      marketdata.Market
+	runDir            string          // unique per-run output directory
+	rootCtx           context.Context // root context, supports --timeout
 )
 
 // createRunDir creates a unique output directory under /tmp/stockctl/
@@ -89,6 +93,13 @@ It provides:
 Configuration: ~/.stockctl/config.toml (override: STOCKCTL_CONFIG env var or --config)
 Output files:  /tmp/stockctl/run_<timestamp>_<id>/ (unique per run, never overwrites)`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		// Start with the flag value. For config-aware commands, an explicit flag
+		// wins; otherwise the configured value is the one and only selected
+		// format used by the command.
+		selected := outputFmt
+		if _, err := output.ParseFormat(selected); err != nil {
+			return err
+		}
 		// Initialize root context (always, even for skipped commands)
 		rootCtx = context.Background()
 		if timeoutStr != "" {
@@ -101,8 +112,11 @@ Output files:  /tmp/stockctl/run_<timestamp>_<id>/ (unique per run, never overwr
 			_ = cancel // cleaned up on process exit
 		}
 
-		// Skip config loading for the markets command
-		if cmd.Name() == "markets" || cmd.Name() == "version" || cmd.Name() == "stats" || cmd.Name() == "clear" {
+		// Skip config loading for commands that intentionally do not use it.
+		if cmd.Name() == "markets" || cmd.Name() == "version" || (cmd.Parent() != nil && cmd.Parent().Name() == "seed") {
+			resolved, _ := output.ParseFormat(selected)
+			resolvedOutputFmt = resolved
+			outputResolved = true
 			return nil
 		}
 
@@ -112,14 +126,23 @@ Output files:  /tmp/stockctl/run_<timestamp>_<id>/ (unique per run, never overwr
 			return fmt.Errorf("loading config %s: %w", cfgFile, err)
 		}
 
-		// Override output format from flag if set
-		if cmd.Flags().Changed("output") {
-			appConfig.General.Output = outputFmt
+		if !cmd.Flags().Changed("output") {
+			selected = appConfig.General.Output
 		}
-
-		// seed history owns a repeatable local --market flag rather than the
-		// single global market selection used by interactive commands.
-		if cmd.Name() == "history" && cmd.Parent() != nil && cmd.Parent().Name() == "seed" {
+		resolved, err := output.ParseFormat(selected)
+		if err != nil {
+			return err
+		}
+		resolvedOutputFmt = resolved
+		outputResolved = true
+		// Keep legacy renderers aligned while they are migrated to consume the
+		// resolved value directly.
+		appConfig.General.Output = string(resolved)
+		// Cache management uses configuration only for the shared output
+		// contract; it deliberately does not select a market or create a run
+		// directory. `cache clear --market` is a local cache filter, not the
+		// application's active-market setting.
+		if cmd.Name() == "stats" || cmd.Name() == "clear" {
 			return nil
 		}
 
@@ -144,17 +167,97 @@ Output files:  /tmp/stockctl/run_<timestamp>_<id>/ (unique per run, never overwr
 }
 
 func Execute() {
-	err := rootCmd.Execute()
+	err := executeRoot(rootCmd, os.Stdout, os.Stderr)
 	if err != nil {
-		// When JSON output was requested, emit structured error envelope on stdout
-		if outputFmt == "json" {
-			env := output.Envelope{
-				Meta:   output.NewMeta("error"),
-				Errors: []output.ErrorInfo{{Error: err.Error()}},
-			}
-			output.WriteEnvelope(os.Stdout, env)
-		}
 		os.Exit(1)
+	}
+}
+
+// executeRoot keeps quiet JSON failures machine-readable while leaving Cobra's
+// standard diagnostics untouched for all other invocations.
+func executeRoot(command *cobra.Command, stdout, stderr io.Writer) error {
+	resolvedOutputFmt = ""
+	outputResolved = false
+	oldSilenceErrors, oldSilenceUsage := command.SilenceErrors, command.SilenceUsage
+	command.SilenceErrors = true
+	command.SilenceUsage = true
+	defer func() {
+		command.SilenceErrors, command.SilenceUsage = oldSilenceErrors, oldSilenceUsage
+	}()
+
+	executed, err := command.ExecuteC()
+	if err == nil {
+		return nil
+	}
+	if alreadyWritten(err) {
+		return err
+	}
+	if quiet && selectedOutputFormat() == output.FormatJSON {
+		if writeErr := output.WriteEnvelope(stdout, errorEnvelope(err)); writeErr != nil {
+			return writeErr
+		}
+		return err
+	}
+	// Cobra's standard error and usage reporting remains available outside
+	// quiet JSON mode.
+	fmt.Fprintf(stderr, "Error: %v\n", err)
+	if !isOutputFormatError(err) && !oldSilenceUsage && (executed == nil || !executed.SilenceUsage) {
+		if executed == nil {
+			executed = command
+		}
+		fmt.Fprint(stderr, executed.UsageString())
+	}
+	return err
+}
+
+func isOutputFormatError(err error) bool {
+	return strings.HasPrefix(err.Error(), "unsupported output format ")
+}
+
+// selectedOutputFormat is set exactly once by PersistentPreRunE after config
+// and flag precedence have been resolved and validated. The fallback supports
+// focused command tests that invoke a RunE directly.
+func selectedOutputFormat() output.Format {
+	if outputResolved {
+		return resolvedOutputFmt
+	}
+	format, err := output.ParseFormat(outputFmt)
+	if err != nil {
+		return output.FormatTable
+	}
+	return format
+}
+
+type outputWrittenError interface {
+	OutputWritten() bool
+}
+
+func alreadyWritten(err error) bool {
+	written, ok := err.(outputWrittenError)
+	return ok && written.OutputWritten()
+}
+
+type jsonResultsError interface {
+	JSONResults() interface{}
+}
+
+type jsonErrorsError interface {
+	JSONErrors() []output.ErrorInfo
+}
+
+func errorEnvelope(err error) output.Envelope {
+	var results interface{}
+	if diagnostic, ok := err.(jsonResultsError); ok {
+		results = diagnostic.JSONResults()
+	}
+	errors := []output.ErrorInfo{{Error: err.Error()}}
+	if diagnostic, ok := err.(jsonErrorsError); ok {
+		errors = append(diagnostic.JSONErrors(), errors...)
+	}
+	return output.Envelope{
+		Meta:    output.NewMeta("error"),
+		Results: results,
+		Errors:  errors,
 	}
 }
 
