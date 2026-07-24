@@ -149,7 +149,25 @@ def scan_is_usable(scan: dict) -> tuple[bool, str]:
 
 
 def final_prompt(payload: dict) -> str:
-    return f"""You are writing the final Telegram update from a completed automated market scan.\n\nRules:\n- Use ONLY this snapshot; do not call tools, browse, fetch quotes, or invent facts.\n- Keep it concise and decision-useful: market regime/breadth first, then at most five candidate tickers.\n- State the report's `data_as_of` date prominently: this is a prior-close daily-bar report, not live execution pricing.\n- Use clear Telegram Markdown. Do not give personalised investment advice or claim certainty.\n- If no candidates passed, say so plainly and highlight breadth/regime instead.\n\nSnapshot:\n{json.dumps(payload, separators=(',', ':'), ensure_ascii=False)}\n"""
+    return f"""You are writing the final Telegram update from a completed automated market scan.
+
+Use ONLY the snapshot below. Do not call tools, browse, fetch quotes, infer missing values, or invent facts. Do not give personalised investment advice, trade recommendations, or certainty language.
+
+Return only the Telegram message. Preserve Telegram Markdown exactly: use bold section headings with `**...**`, italic text with `*...*`, and blank lines between sections. Do not use `##` headers, box-drawing characters, dense tables, or prose paragraphs.
+
+Output contract:
+1. Begin exactly with the applicable header: `🇮🇳 **NSE Pre-Open Brief — <report date>**` for India, or `🇺🇸 **US Pre-Open Brief — <report date>**` for the US. On the next line, add a short italic warning that this is prior-close/non-live data and include the snapshot's `data_as_of` date.
+2. Next, show an immediately visible regime line using exactly one of `🔴 RISK-OFF`, `🟢 RISK-ON`, or `🟡 NEUTRAL`, followed by exactly one sentence explaining the dominant snapshot evidence. Choose only when supported by the snapshot; use `🟡 NEUTRAL` if the evidence is mixed or thin.
+3. Add `🚨 **What matters now**` with no more than two strongest decision-useful facts, including available numbers. If no candidates passed, explicitly say `No actionable setups today`. Use `❗` only when snapshot evidence shows unusually extreme breadth, new-low, or quality-risk conditions; never manufacture urgency.
+4. Add `📊 **Market internals**` with 2–4 compact bullets selected from available facts: index level/trend, breadth, highs/lows, and scan/quality caveat. Skip figures that are unavailable.
+5. Add `🎯 **Watchlist / candidates**` only when candidates exist. Include at most three candidates. Give each exactly two short lines: ticker and why it qualifies; then trigger/invalidation only if present in the snapshot. Do not invent trade advice, upside, targets, or missing data.
+6. Close with `🔎 **Next check**` and one neutral conditional to monitor, tied only to snapshot data.
+
+Keep the entire message about 180–260 words maximum; when the snapshot is thin, make it shorter. Keep it highly scannable with emoji semantic hierarchy, short labeled sections, and blank lines.
+
+Snapshot:
+{json.dumps(payload, separators=(',', ':'), ensure_ascii=False)}
+"""
 
 
 def main() -> int:
