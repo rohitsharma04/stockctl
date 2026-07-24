@@ -117,6 +117,13 @@ var seedProviderFactory = func(noCache bool, rps int) marketdata.Provider {
 	return marketdata.BuildProviderWithRPS(noCache, rps)
 }
 
+// seedCacheRead is a test seam around the cache proof required before a
+// checkpointed success can be trusted on a later resume.
+var seedCacheRead = func(ticker, period string) ([]marketdata.OHLCV, error) {
+	data, _, err := marketdata.ReadCacheEntry(filepath.Join(marketdata.CacheDir(), marketdata.CacheFilename(ticker, period, "1d")))
+	return data, err
+}
+
 func newSeedCmd() *cobra.Command {
 	seedCmd := &cobra.Command{
 		Use:   "seed",
@@ -350,6 +357,7 @@ launches, and supervises delivery. Follow with:
 					checkpoint.Tickers[ticker] = &seedTickerState{Status: "pending", CreatedAt: now, UpdatedAt: now}
 				}
 			}
+			requeueUnverifiedSeedSuccesses(checkpoint, tickers, period, now)
 			if err := saveSeedCheckpoint(stateFile, checkpoint); err != nil {
 				return err
 			}
@@ -578,6 +586,33 @@ func seedTickers(markets []string) ([]string, error) {
 		}
 	}
 	return result, nil
+}
+
+// requeueUnverifiedSeedSuccesses makes checkpoint state subordinate to the
+// durable cache. A success without a readable, period-valid cache entry may
+// have been written by an older buggy seed and must be fetched again.
+func requeueUnverifiedSeedSuccesses(checkpoint *seedCheckpoint, tickers []string, period string, now time.Time) int {
+	requeued := 0
+	for _, ticker := range tickers {
+		st := checkpoint.Tickers[ticker]
+		if st == nil || st.Status != "success" {
+			continue
+		}
+		data, err := seedCacheRead(ticker, period)
+		if err == nil {
+			err = validateSeedHistory(data, period)
+		}
+		if err == nil {
+			continue
+		}
+		st.Status = "pending"
+		st.Attempts = 0
+		st.NextRetry = time.Time{}
+		st.LastError = fmt.Sprintf("checkpoint success cache validation failed: %v", err)
+		st.UpdatedAt = now
+		requeued++
+	}
+	return requeued
 }
 
 func loadSeedCheckpoint(path string) (*seedCheckpoint, error) {

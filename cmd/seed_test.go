@@ -338,6 +338,35 @@ func TestSeedHistoryInitialUniverseRunWritesAtomicCheckpoint(t *testing.T) {
 	}
 }
 
+func TestRequeueUnverifiedSeedSuccesses(t *testing.T) {
+	now := time.Now().UTC()
+	state := &seedCheckpoint{Tickers: map[string]*seedTickerState{
+		"PRESENT": {Status: "success", Attempts: 1, CreatedAt: now, UpdatedAt: now},
+		"MISSING": {Status: "success", Attempts: 1, CreatedAt: now, UpdatedAt: now},
+	}}
+	oldRead := seedCacheRead
+	seedCacheRead = func(ticker, period string) ([]marketdata.OHLCV, error) {
+		if ticker == "MISSING" {
+			return nil, os.ErrNotExist
+		}
+		return []marketdata.OHLCV{{Date: now.AddDate(-1, 0, 0), Close: 100}, {Date: now, Close: 101}}, nil
+	}
+	t.Cleanup(func() { seedCacheRead = oldRead })
+
+	requeued := requeueUnverifiedSeedSuccesses(state, []string{"PRESENT", "MISSING"}, "max", now)
+
+	if requeued != 1 {
+		t.Fatalf("requeued = %d, want 1", requeued)
+	}
+	if state.Tickers["PRESENT"].Status != "success" {
+		t.Fatalf("present cache status = %q, want success", state.Tickers["PRESENT"].Status)
+	}
+	missing := state.Tickers["MISSING"]
+	if missing.Status != "pending" || missing.Attempts != 0 || missing.LastError == "" || !missing.NextRetry.IsZero() {
+		t.Fatalf("missing cache state = %#v, want pending reset for refetch", missing)
+	}
+}
+
 func TestSeedHistoryResumeSkipsSuccesses(t *testing.T) {
 	stateFile := filepath.Join(t.TempDir(), "state.json")
 	tickers, _ := seedTickers([]string{"india"})
@@ -350,6 +379,11 @@ func TestSeedHistoryResumeSkipsSuccesses(t *testing.T) {
 	if err := saveSeedCheckpoint(stateFile, state); err != nil {
 		t.Fatal(err)
 	}
+	oldRead := seedCacheRead
+	seedCacheRead = func(string, string) ([]marketdata.OHLCV, error) {
+		return []marketdata.OHLCV{{Date: now.AddDate(-1, 0, 0), Close: 100}, {Date: now, Close: 101}}, nil
+	}
+	t.Cleanup(func() { seedCacheRead = oldRead })
 	provider := &seedTestProvider{calls: map[string]int{}}
 	if _, _, err := executeSeedHistoryForTest(t, provider, "--market", "india", "--state-file", stateFile); err != nil {
 		t.Fatal(err)
@@ -514,6 +548,15 @@ func TestSeedHistoryDeadlineInterruptionLeavesPendingAndResumes(t *testing.T) {
 	}
 
 	resumeProvider := &seedTestProvider{calls: map[string]int{}}
+	oldRead := seedCacheRead
+	seedCacheRead = func(ticker, period string) ([]marketdata.OHLCV, error) {
+		if ticker == tickers[0] {
+			now := time.Now().UTC()
+			return []marketdata.OHLCV{{Date: now.AddDate(-1, 0, 0), Close: 100}, {Date: now, Close: 101}}, nil
+		}
+		return nil, os.ErrNotExist
+	}
+	t.Cleanup(func() { seedCacheRead = oldRead })
 	resumeSummary, _, err := executeSeedHistoryForTest(t, resumeProvider, "--market", "us", "--state-file", stateFile)
 	if err != nil {
 		t.Fatal(err)
@@ -543,6 +586,11 @@ func TestSeedHistoryFutureRetryStaysPendingWithoutUpstreamCall(t *testing.T) {
 	if err := saveSeedCheckpoint(stateFile, state); err != nil {
 		t.Fatal(err)
 	}
+	oldRead := seedCacheRead
+	seedCacheRead = func(string, string) ([]marketdata.OHLCV, error) {
+		return []marketdata.OHLCV{{Date: now.AddDate(-1, 0, 0), Close: 100}, {Date: now, Close: 101}}, nil
+	}
+	t.Cleanup(func() { seedCacheRead = oldRead })
 	provider := &seedTestProvider{calls: map[string]int{}}
 	summary, stderr, err := executeSeedHistoryForTest(t, provider, "--market", "india", "--state-file", stateFile)
 	if err == nil {
