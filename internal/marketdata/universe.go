@@ -19,7 +19,7 @@ type UniverseIndex struct {
 // EmbeddedUniverses lists all available built-in universes.
 var EmbeddedUniverses = []UniverseIndex{
 	{MarketID: "us", Name: "S&P 500", File: "data/universes/us.csv"},
-	{MarketID: "india", Name: "Nifty 500", File: "data/universes/india.csv"},
+	{MarketID: "india", Name: "NSE listed equities (EQ series)", File: "data/universes/india.csv"},
 	{MarketID: "japan", Name: "Nikkei 225 (Top 100)", File: "data/universes/japan.csv"},
 	{MarketID: "uk", Name: "FTSE 100", File: "data/universes/uk.csv"},
 	{MarketID: "germany", Name: "DAX 40", File: "data/universes/germany.csv"},

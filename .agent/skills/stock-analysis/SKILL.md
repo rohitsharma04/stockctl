@@ -1,6 +1,6 @@
 ---
 name: stock-analysis
-description: Technical analysis CLI for global stock screening (1,821 tickers, 7 strategies), pairs correlation analysis, and TP/SL strategy backtesting across 19 markets.
+- description: Technical analysis CLI for global stock screening, pairs correlation analysis, and TP/SL strategy backtesting across 19 markets.
 ---
 
 # Stock Analysis Skill
@@ -86,7 +86,7 @@ Every market has a pre-loaded ticker universe embedded in the binary. **No `--ti
 | Market | Index | Tickers | Market | Index | Tickers |
 |---|---|---|---|---|---|
 | `us` | S&P 500 | 503 | `hong-kong` | Hang Seng | 59 |
-| `india` | Nifty 500 | 500 | `china` | SSE 50 | 50 |
+| `india` | NSE listed equities (EQ series) | 2,000+ | `china` | SSE 50 | 50 |
 | `japan` | Nikkei 225 | 100 | `taiwan` | TWSE 50 | 50 |
 | `uk` | FTSE 100 | 94 | `australia` | ASX 50 | 50 |
 | `brazil` | Ibovespa | 88 | `france` | CAC 40 | 40 |
@@ -131,7 +131,7 @@ stockctl scan breakout-caution --output json --quiet
 # Dry-run — preview scan plan without fetching data
 stockctl scan all --dry-run --output json --quiet
 
-# Scan Indian NSE — built-in Nifty 500
+# Scan the built-in NSE EQ-series listed-equity universe
 stockctl scan all -m india --output json --quiet
 
 # Historical analysis — run screener as if it were Feb 3rd
@@ -221,7 +221,7 @@ stockctl scan all --timeout 3m --output json --quiet
 
 > **Scoring**: Each result includes `score` (simple pass ratio), `weighted_score` (importance-weighted), `data_confidence` (fraction of filters with valid data), and `actionability_score` (weighted × confidence).
 > **Watchlist fields**: `status` (`confirmed_breakout`, `early_breakout`, `watch`, `avoid`), `status_reason`, `trigger_price`, `invalidation_price`, `atr_stop`, `volume_ratio` vs `required_volume_ratio`.
-> **Sector enrichment**: `sector`, `industry`, `cap_tier` from embedded classification (500 India tickers, 503 US tickers). `avg_traded_value` for liquidity filtering.
+- **Sector enrichment**: `sector`, `industry`, `cap_tier` from embedded classifications (Nifty 500 constituents within the full NSE EQ universe, 503 US tickers). Other NSE listings are intentionally unclassified. `avg_traded_value` for liquidity filtering.
 > **Timeframe alignment**: `timeframe_alignment` shows multi-timeframe confirmation (`daily+weekly+monthly`, `daily+weekly`, `daily_only`, `counter_trend`).
 > **Market summary**: Top-level `market_summary` with benchmark trend, breadth metrics, sector breakdown, and regime label.
 > **Tri-state filters**: Each filter has `status` of `pass`, `fail`, or `unknown`. Unknown filters (missing/NaN data) never count as passes.

@@ -34,7 +34,7 @@ Override path: set `STOCKCTL_CONFIG` env var or use `--config` flag.
 
 ```bash
 stockctl scan breakout-caution --tickers stocks.csv --market india
-stockctl scan all --tickers nifty500.csv --output json
+stockctl scan all --market india --output json
 ```
 
 **Strategies:** `breakout-caution`, `high-performance`, `stellar-breakout`, `descending-breakout`, `rsi-bounce`, `macd-crossover`, `all`
@@ -58,6 +58,22 @@ stockctl backtest --input signals.csv --tp-range 0.10:0.30 --sl-range 0.02:0.05
 ```bash
 stockctl markets
 ```
+
+## NSE universe
+
+`--market india` scans the embedded NSE **EQ-series listed-equity** universe, not
+just Nifty 500 constituents. The checked-in universe is refreshed from NSE's
+official `EQUITY_L.csv`; it intentionally excludes ETFs, debt, preference shares,
+and other non-EQ instruments. Refresh it deliberately, review the resulting diff,
+and then commit it:
+
+```bash
+python3 scripts/refresh_nse_universe.py
+go test ./internal/marketdata
+```
+
+Nifty 500 sector/industry enrichment remains available for its constituents;
+other NSE listings are scanned normally but have no claimed sector classification.
 
 ## Automated morning briefs
 

@@ -6,7 +6,9 @@ import (
 	"testing"
 )
 
-func TestEmbeddedSectorMappingsExactlyCoverUniverses(t *testing.T) {
+func TestEmbeddedSectorMappingsCoverTheirSupportedUniverses(t *testing.T) {
+	// India deliberately embeds the whole NSE EQ universe, while the official
+	// Nifty 500 source only classifies its constituents. US remains exact.
 	for _, market := range []string{"india", "us"} {
 		t.Run(market, func(t *testing.T) {
 			universe, err := GetUniverse(market)
@@ -47,12 +49,14 @@ func TestEmbeddedSectorMappingsExactlyCoverUniverses(t *testing.T) {
 				}
 				got[symbol] = struct{}{}
 			}
-			if len(got) != len(want) {
+			if market == "us" && len(got) != len(want) {
 				t.Fatalf("mapping has %d symbols, universe has %d", len(got), len(want))
 			}
-			for symbol := range want {
-				if _, ok := got[symbol]; !ok {
-					t.Errorf("missing mapping for %q", symbol)
+			if market == "us" {
+				for symbol := range want {
+					if _, ok := got[symbol]; !ok {
+						t.Errorf("missing mapping for %q", symbol)
+					}
 				}
 			}
 			for symbol := range got {
@@ -60,11 +64,14 @@ func TestEmbeddedSectorMappingsExactlyCoverUniverses(t *testing.T) {
 					t.Errorf("extra mapping for %q", symbol)
 				}
 			}
+			if market == "india" && len(got) != 500 {
+				t.Fatalf("India mapping has %d symbols, want exactly the official Nifty 500 classifications", len(got))
+			}
 		})
 	}
 }
 
-func TestEmbeddedIndiaUniverseHasCurrentNifty500Cardinality(t *testing.T) {
+func TestEmbeddedIndiaUniverseCoversNSEListedEquities(t *testing.T) {
 	universe, err := GetUniverse("india")
 	if err != nil {
 		t.Fatalf("GetUniverse(India): %v", err)
@@ -76,7 +83,14 @@ func TestEmbeddedIndiaUniverseHasCurrentNifty500Cardinality(t *testing.T) {
 		}
 		unique[symbol] = struct{}{}
 	}
-	if len(universe) != 500 {
-		t.Fatalf("embedded India universe has %d symbols, want 500", len(universe))
+	// NSE's official EQUITY_L.csv contains well over 2,000 current EQ-series
+	// listings.  This guard prevents accidentally reverting to Nifty 500.
+	if len(universe) < 2000 {
+		t.Fatalf("embedded India universe has %d symbols, want at least 2,000 NSE listed equities", len(universe))
+	}
+	for _, symbol := range []string{"20MICRONS", "RELIANCE", "ZYDUSWELL"} {
+		if _, ok := unique[symbol]; !ok {
+			t.Errorf("embedded India universe is missing NSE listed equity %q", symbol)
+		}
 	}
 }
