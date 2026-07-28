@@ -19,6 +19,15 @@ class DueMarketTests(unittest.TestCase):
         self.assertEqual(brief.due_market(now), "india")
 
 
+class ScanCommandTests(unittest.TestCase):
+    def test_full_nse_scan_has_a_deadline_that_allows_the_global_rate_limit(self):
+        command = brief.build_scan_command("india", dt.date(2026, 7, 27))
+
+        self.assertEqual(command[0], str(brief.BIN))
+        self.assertEqual(command[command.index("--timeout") + 1], "10m")
+        self.assertGreater(brief.SCAN_PROCESS_TIMEOUT_SECONDS, 10 * 60)
+
+
 class FinalPromptTests(unittest.TestCase):
     def test_embeds_telegram_presentation_contract_and_snapshot(self):
         payload = {

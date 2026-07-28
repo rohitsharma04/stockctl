@@ -23,6 +23,12 @@ ROOT = Path(__file__).resolve().parents[1]
 BIN = Path(os.environ.get("STOCKCTL_BIN", ROOT / "bin" / "stockctl"))
 STATE_ROOT = Path(os.environ.get("STOCKCTL_BRIEF_STATE", "/tmp/stockctl/market-briefs"))
 LOCK_PATH = Path("/tmp/stockctl/market-brief.lock")
+# A full NSE EQ scan can require up to 2,060 Yahoo requests. At the provider's
+# shared 5 RPS limit, a four-minute deadline inevitably drops otherwise valid
+# symbols while they wait for a limiter token. Keep the CLI deadline above that
+# lower bound and give the wrapper a small process-level grace period.
+SCAN_TIMEOUT = "10m"
+SCAN_PROCESS_TIMEOUT_SECONDS = 630
 
 MARKETS = {
     "india": {
@@ -170,6 +176,14 @@ Snapshot:
 """
 
 
+def build_scan_command(market: str, data_as_of: dt.date) -> list[str]:
+    return [
+        str(BIN), "scan", "breakout-caution", "--market", market,
+        "--date", data_as_of.isoformat(), "--workers", "2", "--min-score", "0.67", "--detail",
+        "--timeout", SCAN_TIMEOUT, "--output", "json", "--quiet",
+    ]
+
+
 def main() -> int:
     now_utc = dt.datetime.now(dt.timezone.utc)
     try:
@@ -211,13 +225,15 @@ def main() -> int:
         if sent_path.exists() and not os.getenv("STOCKCTL_BRIEF_FORCE_MARKET"):
             return 0
 
-        command = [
-            str(BIN), "scan", "breakout-caution", "--market", market,
-            "--date", data_as_of.isoformat(), "--workers", "2", "--min-score", "0.67", "--detail",
-            "--timeout", "4m", "--output", "json", "--quiet",
-        ]
+        command = build_scan_command(market, data_as_of)
         log("starting a single rate-limited scan: " + " ".join(command[1:]))
-        result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, timeout=270)
+        result = subprocess.run(
+            command,
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=SCAN_PROCESS_TIMEOUT_SECONDS,
+        )
         if result.returncode != 0:
             log(f"stockctl failed (exit {result.returncode}): {result.stderr[-800:]}")
             return result.returncode or 1
