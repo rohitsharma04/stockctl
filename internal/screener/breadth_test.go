@@ -137,6 +137,23 @@ func TestComputeBenchmarkStatus_InsufficientData(t *testing.T) {
 	}
 }
 
+func TestComputeBenchmarkStatus_ZeroPriorCloseProducesFiniteMomentum(t *testing.T) {
+	data := make([]marketdata.OHLCV, 201)
+	for i := range data {
+		data[i] = marketdata.OHLCV{Close: 100, High: 101, Low: 99, Volume: 1_000_000}
+	}
+	data[len(data)-23].Close = 0
+	data[len(data)-1].Close = 100
+
+	status := ComputeBenchmarkStatus("^NSEI", data)
+	if math.IsInf(status.Momentum22D, 0) || math.IsNaN(status.Momentum22D) {
+		t.Fatalf("momentum must be JSON-safe when the prior close is zero, got %v", status.Momentum22D)
+	}
+	if status.Momentum22D != 0 {
+		t.Fatalf("expected unavailable momentum to be represented as 0, got %v", status.Momentum22D)
+	}
+}
+
 func TestComputeBenchmarkStatus_Uptrend(t *testing.T) {
 	// Create synthetic data: steadily rising
 	data := make([]marketdata.OHLCV, 300)
@@ -144,10 +161,10 @@ func TestComputeBenchmarkStatus_Uptrend(t *testing.T) {
 	start := time.Date(2021, 1, 4, 0, 0, 0, 0, time.UTC)
 	for i := range data {
 		data[i] = marketdata.OHLCV{
-			Date: start.AddDate(0, 0, i),
-			Close: price,
-			High: price * 1.01,
-			Low: price * 0.99,
+			Date:   start.AddDate(0, 0, i),
+			Close:  price,
+			High:   price * 1.01,
+			Low:    price * 0.99,
 			Volume: 1000000,
 		}
 		price *= 1.001

@@ -12,14 +12,14 @@ import (
 type BreadthSummary struct {
 	TotalScanned   int     `json:"total_scanned"`
 	FullPasses     int     `json:"full_passes"`
-	NearMisses     int     `json:"near_misses"`       // score >= 0.67 but not full pass
+	NearMisses     int     `json:"near_misses"` // score >= 0.67 but not full pass
 	PassRate       float64 `json:"pass_rate"`
 	MedianScore    float64 `json:"median_score"`
 	AboveSMA50Pct  float64 `json:"above_sma50_pct"`
 	AboveSMA200Pct float64 `json:"above_sma200_pct"`
 	NewHighs       int     `json:"new_highs"`
 	NewLows        int     `json:"new_lows"`
-	RegimeLabel    string  `json:"regime_label"`       // broad_risk_on, narrow_leadership, mixed, risk_off
+	RegimeLabel    string  `json:"regime_label"` // broad_risk_on, narrow_leadership, mixed, risk_off
 }
 
 // BenchmarkStatus describes the current trend state of the benchmark index.
@@ -29,7 +29,7 @@ type BenchmarkStatus struct {
 	AboveSMA50  bool    `json:"above_sma50"`
 	AboveSMA200 bool    `json:"above_sma200"`
 	Momentum22D float64 `json:"momentum_22d"`
-	TrendLabel  string  `json:"trend_label"`  // uptrend, downtrend, neutral
+	TrendLabel  string  `json:"trend_label"` // uptrend, downtrend, neutral
 }
 
 // SectorBreadth summarizes screening results for a single sector.
@@ -53,14 +53,14 @@ type MarketSummary struct {
 
 // TickerBreadthData holds the per-ticker data needed for breadth computation.
 type TickerBreadthData struct {
-	Ticker     string
-	Score      float64
-	FullPass   bool
+	Ticker      string
+	Score       float64
+	FullPass    bool
 	AboveSMA50  bool
 	AboveSMA200 bool
-	NewHigh    bool // 52-week high
-	NewLow     bool // 52-week low
-	Sector     string
+	NewHigh     bool // 52-week high
+	NewLow      bool // 52-week low
+	Sector      string
 }
 
 // ComputeBreadth aggregates breadth stats from per-ticker data.
@@ -148,9 +148,13 @@ func ComputeBenchmarkStatus(symbol string, data []marketdata.OHLCV) BenchmarkSta
 	bs.AboveSMA50 = !math.IsNaN(sma50[n-1]) && closes[n-1] > sma50[n-1]
 	bs.AboveSMA200 = !math.IsNaN(sma200[n-1]) && closes[n-1] > sma200[n-1]
 
-	// 22-day momentum
-	if n >= 23 {
-		bs.Momentum22D = (closes[n-1] - closes[n-23]) / closes[n-23]
+	// 22-day momentum. A zero/invalid prior close means the percentage change
+	// is undefined; leave the JSON-safe zero value rather than emitting Inf/NaN.
+	if n >= 23 && closes[n-23] != 0 && !math.IsNaN(closes[n-23]) && !math.IsInf(closes[n-23], 0) {
+		momentum := (closes[n-1] - closes[n-23]) / closes[n-23]
+		if !math.IsNaN(momentum) && !math.IsInf(momentum, 0) {
+			bs.Momentum22D = momentum
+		}
 	}
 
 	// Trend label
