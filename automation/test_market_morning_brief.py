@@ -20,12 +20,13 @@ class DueMarketTests(unittest.TestCase):
 
 
 class ScanCommandTests(unittest.TestCase):
-    def test_full_nse_scan_has_a_deadline_that_allows_the_global_rate_limit(self):
+    def test_full_nse_scan_has_a_deadline_that_covers_retries_and_rate_limiting(self):
         command = brief.build_scan_command("india", dt.date(2026, 7, 27))
 
         self.assertEqual(command[0], str(brief.BIN))
-        self.assertEqual(command[command.index("--timeout") + 1], "10m")
-        self.assertGreater(brief.SCAN_PROCESS_TIMEOUT_SECONDS, 10 * 60)
+        self.assertEqual(command[command.index("--timeout") + 1], "45m")
+        self.assertGreaterEqual(brief.SCAN_PROCESS_TIMEOUT_SECONDS, 50 * 60)
+        self.assertGreater(brief.SCAN_PROCESS_TIMEOUT_SECONDS, 45 * 60)
 
 
 class FinalPromptTests(unittest.TestCase):

@@ -23,12 +23,13 @@ ROOT = Path(__file__).resolve().parents[1]
 BIN = Path(os.environ.get("STOCKCTL_BIN", ROOT / "bin" / "stockctl"))
 STATE_ROOT = Path(os.environ.get("STOCKCTL_BRIEF_STATE", "/tmp/stockctl/market-briefs"))
 LOCK_PATH = Path("/tmp/stockctl/market-brief.lock")
-# A full NSE EQ scan can require up to 2,060 Yahoo requests. At the provider's
-# shared 5 RPS limit, a four-minute deadline inevitably drops otherwise valid
-# symbols while they wait for a limiter token. Keep the CLI deadline above that
-# lower bound and give the wrapper a small process-level grace period.
-SCAN_TIMEOUT = "10m"
-SCAN_PROCESS_TIMEOUT_SECONDS = 630
+# A full NSE EQ scan now covers roughly 2,600 symbols. Yahoo is shared and
+# rate-limited to 5 RPS, while transient provider failures can each consume up
+# to three attempts. A 10-minute deadline therefore cancels a healthy scan on
+# slow days. Give the CLI 45 minutes and the outer wrapper five additional
+# minutes for process cleanup, while retaining a finite failure ceiling.
+SCAN_TIMEOUT = "45m"
+SCAN_PROCESS_TIMEOUT_SECONDS = 50 * 60
 
 MARKETS = {
     "india": {
